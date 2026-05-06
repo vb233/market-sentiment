@@ -1,0 +1,44 @@
+name: Daily market snapshot
+
+on:
+  schedule:
+    # 22:00 UTC, Monday–Friday (~5–6pm ET, after US market close).
+    # GitHub may delay scheduled runs by up to ~30 min during peak load.
+    - cron: "0 22 * * 1-5"
+  workflow_dispatch:  # also allow manual runs from the Actions tab
+
+permissions:
+  contents: write   # needed to commit the updated CSV
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch today's snapshot
+        run: python fetch_snapshot.py
+
+      - name: Commit updated CSV
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/snapshots.csv
+          if git diff --staged --quiet; then
+            echo "No changes — nothing to commit."
+          else
+            git commit -m "Snapshot $(date -u +%Y-%m-%d)"
+            git push
+          fi
