@@ -13,7 +13,10 @@ date overwrites that day's row.
 
 import csv
 import datetime as dt
+import io
 import sys
+import time
+import traceback
 from pathlib import Path
 
 import pandas as pd
@@ -30,21 +33,19 @@ HEADERS = [
     "fetched_at",
 ]
 
+UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
+
 
 # ─── Fear & Greed ──────────────────────────────────────────────────────────
 def fetch_fear_greed() -> float:
     """CNN's public dataviz endpoint. Returns the current composite score."""
     url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-        ),
-    }
-    r = requests.get(url, headers=headers, timeout=30)
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
     r.raise_for_status()
-    data = r.json()
-    return float(data["fear_and_greed"]["score"])
+    return float(r.json()["fear_and_greed"]["score"])
 
 
 # ─── VIX ────────────────────────────────────────────────────────────────────
@@ -58,36 +59,73 @@ def fetch_vix() -> float:
 
 # ─── S&P 500 breadth ───────────────────────────────────────────────────────
 def get_sp500_tickers() -> list[str]:
-    """Pull current S&P 500 constituents from Wikipedia."""
+    """Pull current S&P 500 constituents from Wikipedia (with a real UA)."""
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url)
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
+    r.raise_for_status()
+    tables = pd.read_html(io.StringIO(r.text))
     df = tables[0]
     # Yahoo uses '-' instead of '.' for dual-class tickers (BRK.B → BRK-B)
     return df["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
 
 
+def _download_chunk(chunk: list[str]) -> dict[str, pd.Series]:
+    """Download Closes for a small list of tickers, with up to 3 retries."""
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            data = yf.download(
+                chunk,
+                period="1y",
+                interval="1d",
+                group_by="ticker",
+                progress=False,
+                auto_adjust=True,
+                threads=True,
+            )
+            if data is None or data.empty:
+                raise RuntimeError("empty DataFrame returned")
+            out: dict[str, pd.Series] = {}
+            if len(chunk) == 1:
+                # Single-ticker downloads come back un-grouped
+                t = chunk[0]
+                if "Close" in data.columns:
+                    out[t] = data["Close"].dropna()
+            else:
+                for t in chunk:
+                    try:
+                        out[t] = data[t]["Close"].dropna()
+                    except (KeyError, TypeError):
+                        continue
+            return out
+        except Exception as e:
+            last_err = e
+            print(f"  chunk attempt {attempt} failed: {e!r}", file=sys.stderr)
+            time.sleep(3 * attempt)  # linear backoff
+    print(f"  chunk gave up after 3 tries: {last_err!r}", file=sys.stderr)
+    return {}
+
+
 def fetch_sp500_breadth() -> tuple[float | None, float | None]:
     """% of S&P 500 names above their 50-day SMA and 200-day SMA."""
     tickers = get_sp500_tickers()
-    # 1y of daily history is plenty for a 200-day SMA.
-    data = yf.download(
-        tickers,
-        period="1y",
-        interval="1d",
-        group_by="ticker",
-        progress=False,
-        auto_adjust=True,
-        threads=True,
-    )
+    print(f"Fetched {len(tickers)} S&P 500 tickers")
+
+    all_closes: dict[str, pd.Series] = {}
+    chunk_size = 50
+    for i in range(0, len(tickers), chunk_size):
+        chunk = tickers[i : i + chunk_size]
+        print(
+            f"Downloading chunk {i // chunk_size + 1} "
+            f"({i + 1}–{i + len(chunk)} of {len(tickers)})..."
+        )
+        all_closes.update(_download_chunk(chunk))
+        time.sleep(2)  # polite pause to avoid Yahoo rate limits
 
     above_50 = above_200 = 0
     valid_50 = valid_200 = 0
 
-    for t in tickers:
-        try:
-            closes = data[t]["Close"].dropna()
-        except (KeyError, TypeError):
-            continue
+    for closes in all_closes.values():
         if len(closes) < 50:
             continue
         last = float(closes.iloc[-1])
@@ -106,9 +144,17 @@ def fetch_sp500_breadth() -> tuple[float | None, float | None]:
     pct_50 = 100.0 * above_50 / valid_50 if valid_50 else None
     pct_200 = 100.0 * above_200 / valid_200 if valid_200 else None
     print(
-        f"Breadth computed from {valid_50} (50d) / {valid_200} (200d) "
-        f"valid tickers out of {len(tickers)}"
+        f"Breadth: {valid_50}/{len(tickers)} valid for 50d, "
+        f"{valid_200}/{len(tickers)} for 200d"
     )
+
+    # If we got essentially nothing, surface a real error to the logs.
+    if valid_50 < 50:
+        raise RuntimeError(
+            f"Only {valid_50} of {len(tickers)} tickers returned usable price data "
+            f"— likely Yahoo rate-limiting. Re-run the workflow in a few minutes."
+        )
+
     return pct_50, pct_200
 
 
@@ -129,6 +175,7 @@ def main() -> int:
                 vix = val
             print(f"{name}: {val:.2f}")
         except Exception as e:
+            traceback.print_exc()
             errors.append(f"{name}: {e!r}")
 
     try:
@@ -136,10 +183,13 @@ def main() -> int:
         print(f"spx_above_50ma:  {pct50:.2f}" if pct50 is not None else "spx_above_50ma: n/a")
         print(f"spx_above_200ma: {pct200:.2f}" if pct200 is not None else "spx_above_200ma: n/a")
     except Exception as e:
+        traceback.print_exc()
         errors.append(f"breadth: {e!r}")
 
     if errors:
-        print("Errors during fetch:", *errors, sep="\n  ", file=sys.stderr)
+        print("\n=== Errors during fetch ===", file=sys.stderr)
+        for err in errors:
+            print(f"  {err}", file=sys.stderr)
 
     # Load existing rows, replace today's if present, append, sort, write.
     rows: list[dict] = []
