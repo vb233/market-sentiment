@@ -3,3 +3,4 @@ pandas>=2.1
 yfinance>=0.2.40
 lxml>=4.9
 html5lib>=1.1
+pytickersymbols>=1.16
