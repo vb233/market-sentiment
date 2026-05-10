@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Market Pulse · Daily breadth & sentiment</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E📊%3C/text%3E%3C/svg%3E" />
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=DM+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap"
+    rel="stylesheet"
+  />
+
+  <!-- Tailwind (CDN, no build step) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- React 18 + ReactDOM -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+  <!-- Recharts + peer dep -->
+  <script crossorigin src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+  <script crossorigin src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+
+  <!-- Babel to transform JSX in the browser -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    body {
+      background: #0c0c0e;
+      font-family: "DM Sans", sans-serif;
+      color: #e8e4dc;
+      margin: 0;
+    }
+    .recharts-text { font-family: "JetBrains Mono", monospace; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel" data-presets="react">
+    // ────────────────────────────────────────────────────────────────────────
+    // CONFIG — edit if you rename or move the repo
+    // ────────────────────────────────────────────────────────────────────────
+    const GH_USER   = "vb233";
+    const GH_REPO   = "market-sentiment";
+    const GH_BRANCH = "main";
+    const GH_PATH   = "data/snapshots.csv";
+
+    const RAW_URL = `https://raw.githubusercontent.com/${GH_USER}/${GH_REPO}/refs/heads/${GH_BRANCH}/${GH_PATH}`;
+    const REFRESH_INTERVAL_MS = 15 * 60 * 1000; // auto-refresh every 15 min
+
+    // ────────────────────────────────────────────────────────────────────────
+    const {
+      LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer,
+      ReferenceLine, Legend,
+    } = Recharts;
+    const { useState, useEffect, useCallback } = React;
+
+    // Design tokens
+    const C = {
+      bg: "#0c0c0e", bgCard: "#15161a",
+      border: "#25262a", borderStrong: "#33343a",
+      text: "#e8e4dc", textMuted: "#7a766f", textFaint: "#4a4742",
+      gold: "#d9b072", red: "#c5524a", green: "#6a9d76",
+      yellow: "#c5a04a", blue: "#6e8db5",
+    };
+
+    // Helpers
+    const fmtDate = (iso) => {
+      const d = new Date(iso + "T12:00:00");
+      return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+    };
+    const fmtDateLong = (iso) => {
+      const d = new Date(iso + "T12:00:00");
+      return d.toLocaleDateString("en-US", {
+        weekday: "long", year: "numeric", month: "long", day: "numeric",
+      });
+    };
+    const fmtNum = (v, digits = 1) =>
+      v == null || isNaN(v) ? "—" : Number(v).toFixed(digits);
+    const fmtPrice = (v) =>
+      v == null || isNaN(v) ? "—" :
+      Number(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const num = (v) => {
+      if (v === null || v === undefined || v === "") return null;
+      const n = Number(v);
+      return isNaN(n) ? null : n;
+    };
+    const todayISO = () => new Date().toISOString().split("T")[0];
+
+    // Status bands
+    const fgStatus = (v) => {
+      if (v == null || isNaN(v)) return { label: "—", color: C.textMuted };
+      if (v <= 25) return { label: "Extreme Fear", color: C.red };
+      if (v <= 45) return { label: "Fear", color: "#d97a4a" };
+      if (v <= 55) return { label: "Neutral", color: C.yellow };
+      if (v <= 75) return { label: "Greed", color: C.green };
+      return { label: "Extreme Greed", color: "#9aa86a" };
+    };
+    const vixStatus = (v) => {
+      if (v == null || isNaN(v)) return { label: "—", color: C.textMuted };
+      if (v < 15) return { label: "Calm", color: C.green };
+      if (v < 20) return { label: "Normal", color: "#9aa86a" };
+      if (v < 30) return { label: "Elevated", color: C.yellow };
+      if (v < 40) return { label: "High", color: "#d97a4a" };
+      return { label: "Panic", color: C.red };
+    };
+    const breadthStatus = (v) => {
+      if (v == null || isNaN(v)) return { label: "—", color: C.textMuted };
+      if (v < 20) return { label: "Oversold", color: C.red };
+      if (v < 40) return { label: "Weak", color: "#d97a4a" };
+      if (v < 60) return { label: "Mixed", color: C.yellow };
+      if (v < 80) return { label: "Healthy", color: C.green };
+      return { label: "Overbought", color: "#9aa86a" };
+    };
+
+    // CSV parsing
+    function parseCSV(text) {
+      const lines = text.trim().split(/\r?\n/);
+      let headerIdx = lines.findIndex((l) =>
+        l.trim().toLowerCase().startsWith("date,")
+      );
+      if (headerIdx < 0) headerIdx = 0;
+      if (lines.length - headerIdx < 2) return [];
+      const headers = lines[headerIdx].split(",").map((h) => h.trim());
+      const rows = [];
+      for (let i = headerIdx + 1; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        const cells = line.split(",");
+        if (cells.length < headers.length) continue;
+        const r = {};
+        for (let j = 0; j < headers.length; j++) {
+          r[headers[j]] = (cells[j] ?? "").trim();
+        }
+        if (r.date && /^\d{4}-\d{2}-\d{2}$/.test(r.date)) {
+          rows.push({
+            date: r.date,
+            sp500: num(r.sp500),
+            fearGreed: num(r.fear_greed),
+            vix: num(r.vix),
+            spxAbove50: num(r.spx_above_50ma),
+            spxAbove200: num(r.spx_above_200ma),
+          });
+        }
+      }
+      rows.sort((a, b) => a.date.localeCompare(b.date));
+      return rows;
+    }
+
+    async function fetchCSV() {
+      const url = `${RAW_URL}?_=${Date.now()}`;
+      const r = await fetch(url, { cache: "no-store" });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return parseCSV(await r.text());
+    }
+
+    // ─── Components ─────────────────────────────────────────────────────────
+    function SP500Banner({ snap, prevSnap }) {
+      const v = snap?.sp500;
+      const prev = prevSnap?.sp500;
+      let change = null, changePct = null, changeColor = C.textMuted;
+      if (v != null && prev != null && !isNaN(v) && !isNaN(prev)) {
+        change = v - prev;
+        changePct = (change / prev) * 100;
+        changeColor = change > 0 ? C.green : change < 0 ? C.red : C.textMuted;
+      }
+      return (
+        <div
+          className="p-7 rounded-sm flex items-center justify-between flex-wrap gap-6 mb-4"
+          style={{
+            background: C.bgCard,
+            border: `1px solid ${C.border}`,
+            borderLeft: `3px solid ${C.gold}`,
+          }}
+        >
+          <div>
+            <div style={{
+              fontFamily: "'DM Sans', sans-serif", fontSize: "11px",
+              fontWeight: 600, letterSpacing: "0.12em", color: C.textMuted,
+              textTransform: "uppercase", marginBottom: "8px",
+            }}>S&P 500 · ^GSPC</div>
+            <div style={{
+              fontFamily: "'Fraunces', serif", fontSize: "64px", lineHeight: 1,
+              fontWeight: 500, color: C.text, letterSpacing: "-0.02em",
+            }}>{fmtPrice(v)}</div>
+          </div>
+          {change != null && (
+            <div className="text-right">
+              <div style={{
+                fontFamily: "'JetBrains Mono', monospace", fontSize: "20px",
+                fontWeight: 500, color: changeColor,
+              }}>
+                {change >= 0 ? "▲" : "▼"} {fmtPrice(Math.abs(change))}
+              </div>
+              <div style={{
+                fontFamily: "'JetBrains Mono', monospace", fontSize: "14px",
+                color: changeColor, marginTop: "4px",
+              }}>
+                {change >= 0 ? "+" : "−"}{Math.abs(changePct).toFixed(2)}%
+              </div>
+              <div style={{
+                fontFamily: "'DM Sans', sans-serif", fontSize: "11px",
+                color: C.textFaint, marginTop: "8px",
+                letterSpacing: "0.06em", textTransform: "uppercase",
+              }}>vs prior session</div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function MetricCard({ label, ticker, value, status, description }) {
+      return (
+        <div
+          className="relative p-6 rounded-sm flex flex-col"
+          style={{
+            background: C.bgCard, border: `1px solid ${C.border}`,
+            minHeight: "180px",
+          }}
+        >
+          <div className="flex items-baseline justify-between mb-1">
+            <span style={{
+              fontFamily: "'DM Sans', sans-serif", fontSize: "11px",
+              fontWeight: 600, letterSpacing: "0.12em", color: C.textMuted,
+              textTransform: "uppercase",
+            }}>{label}</span>
+            <span style={{
+              fontFamily: "'JetBrains Mono', monospace", fontSize: "10px",
+              color: C.textFaint,
+            }}>{ticker}</span>
+          </div>
+          <div style={{
+            fontFamily: "'Fraunces', serif", fontSize: "56px", lineHeight: 1,
+            fontWeight: 500, color: C.text, letterSpacing: "-0.02em",
+            marginTop: "12px",
+          }}>{fmtNum(value, 1)}</div>
+          <div className="mt-3 flex items-center gap-2">
+            <div style={{
+              width: "6px", height: "6px",
+              background: status.color, borderRadius: "50%",
+            }} />
+            <span style={{
+              fontFamily: "'DM Sans', sans-serif", fontSize: "13px",
+              fontWeight: 500, color: status.color, letterSpacing: "0.02em",
+            }}>{status.label}</span>
+          </div>
+          <div style={{
+            fontFamily: "'DM Sans', sans-serif", fontSize: "12px",
+            color: C.textMuted, marginTop: "10px", lineHeight: 1.5,
+          }}>{description}</div>
+        </div>
+      );
+    }
+
+    function MarketBreadthChart({ data }) {
+      const last = data[data.length - 1] || {};
+      return (
+        <div className="p-6 rounded-sm" style={{ background: C.bgCard, border: `1px solid ${C.border}` }}>
+          <div className="flex items-baseline justify-between mb-4 flex-wrap gap-2">
+            <div>
+              <div style={{
+                fontFamily: "'DM Sans', sans-serif", fontSize: "11px",
+                fontWeight: 600, letterSpacing: "0.12em", color: C.textMuted,
+                textTransform: "uppercase",
+              }}>Market Breadth</div>
+              <div style={{
+                fontFamily: "'Fraunces', serif", fontSize: "20px",
+                fontWeight: 500, marginTop: "4px", letterSpacing: "-0.01em",
+              }}>S&P 500 vs share above moving averages</div>
+            </div>
+            <div className="flex gap-5 text-right">
+              <div>
+                <div style={{ fontSize: "10px", color: C.textFaint, letterSpacing: "0.08em", textTransform: "uppercase" }}>SPX</div>
+                <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: "13px", color: C.gold }}>{fmtPrice(last.sp500)}</div>
+              </div>
+              <div>
+                <div style={{ fontSize: "10px", color: C.textFaint, letterSpacing: "0.08em", textTransform: "uppercase" }}>&gt;50d</div>
+                <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: "13px", color: C.blue }}>{fmtNum(last.spxAbove50, 1)}%</div>
+              </div>
+              <div>
+                <div style={{ fontSize: "10px", color: C.textFaint, letterSpacing: "0.08em", textTransform: "uppercase" }}>&gt;200d</div>
+                <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: "13px", color: C.green }}>{fmtNum(last.spxAbove200, 1)}%</div>
+              </div>
+            </div>
+          </div>
+          <div style={{ height: "320px" }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={data} margin={{ top: 10, right: 12, bottom: 5, left: 0 }}>
+                <XAxis
+                  dataKey="date"
+                  tick={{ fontSize: 11, fill: C.textFaint }}
+                  tickFormatter={fmtDate}
+                  axisLine={{ stroke: C.border }}
+                  tickLine={{ stroke: C.border }}
+                  interval="preserveStartEnd"
+                  minTickGap={40}
+                />
+                <YAxis
+                  yAxisId="price" orientation="left" domain={["auto", "auto"]}
+                  tick={{ fontSize: 11, fill: C.gold }}
+                  axisLine={{ stroke: C.border }} tickLine={{ stroke: C.border }}
+                  width={56}
+                  tickFormatter={(v) => Number(v).toLocaleString("en-US", { maximumFractionDigits: 0 })}
+                />
+                <YAxis
+                  yAxisId="pct" orientation="right" domain={[0, 100]}
+                  tick={{ fontSize: 11, fill: C.textFaint }}
+                  axisLine={{ stroke: C.border }} tickLine={{ stroke: C.border }}
+                  width={36} tickFormatter={(v) => `${v}`}
+                />
+                <ReferenceLine y={50} yAxisId="pct" stroke={C.borderStrong} strokeDasharray="3 4" strokeWidth={1} />
+                <Tooltip
+                  contentStyle={{
+                    background: C.bg, border: `1px solid ${C.borderStrong}`,
+                    borderRadius: "2px", fontFamily: "JetBrains Mono",
+                    fontSize: "12px", color: C.text,
+                  }}
+                  labelFormatter={fmtDate}
+                  formatter={(v, name) => {
+                    if (v == null) return ["—", name];
+                    if (name === "S&P 500") return [fmtPrice(v), name];
+                    return [`${Number(v).toFixed(1)}%`, name];
+                  }}
+                />
+                <Legend wrapperStyle={{ fontFamily: "'DM Sans', sans-serif", fontSize: "12px", paddingTop: "8px" }} iconType="plainline" />
+                <Line yAxisId="price" type="monotone" dataKey="sp500" name="S&P 500" stroke={C.gold} strokeWidth={2} dot={false} activeDot={{ r: 3, fill: C.gold, stroke: C.bg, strokeWidth: 1 }} connectNulls />
+                <Line yAxisId="pct" type="monotone" dataKey="spxAbove50" name="% above 50-day" stroke={C.blue} strokeWidth={1.5} dot={false} activeDot={{ r: 3, fill: C.blue, stroke: C.bg, strokeWidth: 1 }} connectNulls />
+                <Line yAxisId="pct" type="monotone" dataKey="spxAbove200" name="% above 200-day" stroke={C.green} strokeWidth={1.5} dot={false} activeDot={{ r: 3, fill: C.green, stroke: C.bg, strokeWidth: 1 }} connectNulls />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+          <div style={{ fontSize: "11px", color: C.textFaint, marginTop: "8px", fontFamily: "'DM Sans', sans-serif", lineHeight: 1.6 }}>
+            Watch for divergences: S&P pushing higher while breadth lines fall is a classic warning sign that fewer names are participating in the rally.
+          </div>
+        </div>
+      );
+    }
+
+    function MiniChart({ data, dataKey, color, label, domain, refLines = [] }) {
+      const last = data[data.length - 1];
+      const lastValue = last ? last[dataKey] : null;
+      return (
+        <div className="p-5 rounded-sm" style={{ background: C.bgCard, border: `1px solid ${C.border}` }}>
+          <div className="flex items-baseline justify-between mb-2">
+            <span style={{
+              fontFamily: "'DM Sans', sans-serif", fontSize: "11px",
+              fontWeight: 600, letterSpacing: "0.12em", color: C.textMuted,
+              textTransform: "uppercase",
+            }}>{label}</span>
+            <span style={{
+              fontFamily: "'JetBrains Mono', monospace", fontSize: "14px",
+              color: C.text, fontWeight: 500,
+            }}>{fmtNum(lastValue, 1)}</span>
+          </div>
+          <div style={{ height: "120px" }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={data} margin={{ top: 5, right: 5, bottom: 5, left: 0 }}>
+                <XAxis
+                  dataKey="date"
+                  tick={{ fontSize: 10, fill: C.textFaint }}
+                  tickFormatter={fmtDate}
+                  axisLine={{ stroke: C.border }} tickLine={{ stroke: C.border }}
+                  interval="preserveStartEnd" minTickGap={30}
+                />
+                <YAxis
+                  domain={domain}
+                  tick={{ fontSize: 10, fill: C.textFaint }}
+                  axisLine={{ stroke: C.border }} tickLine={{ stroke: C.border }}
+                  width={32}
+                />
+                {refLines.map((rl, i) => (
+                  <ReferenceLine key={i} y={rl.y} stroke={C.borderStrong} strokeDasharray="2 3" strokeWidth={1} />
+                ))}
+                <Tooltip
+                  contentStyle={{
+                    background: C.bg, border: `1px solid ${C.borderStrong}`,
+                    borderRadius: "2px", fontFamily: "JetBrains Mono",
+                    fontSize: "12px", color: C.text,
+                  }}
+                  labelFormatter={fmtDate}
+                  formatter={(v) => (v != null ? Number(v).toFixed(2) : "—")}
+                />
+                <Line type="monotone" dataKey={dataKey} stroke={color} strokeWidth={1.5} dot={false} activeDot={{ r: 3, fill: color, stroke: C.bg, strokeWidth: 1 }} connectNulls />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      );
+    }
+
+    function HistoryTable({ snapshots }) {
+      const recent = [...snapshots].reverse().slice(0, 14);
+      if (recent.length === 0) return null;
+      const cell = {
+        fontFamily: "'JetBrains Mono', monospace", fontSize: "13px",
+        color: C.text, padding: "10px 14px",
+        borderBottom: `1px solid ${C.border}`,
+      };
+      const header = {
+        fontFamily: "'DM Sans', sans-serif", fontSize: "10px",
+        fontWeight: 600, letterSpacing: "0.12em", color: C.textMuted,
+        textTransform: "uppercase", padding: "12px 14px",
+        borderBottom: `1px solid ${C.borderStrong}`, textAlign: "left",
+      };
+      return (
+        <div className="rounded-sm overflow-x-auto" style={{ background: C.bgCard, border: `1px solid ${C.border}` }}>
+          <table className="w-full" style={{ minWidth: "720px" }}>
+            <thead>
+              <tr>
+                <th style={header}>Date</th>
+                <th style={{ ...header, textAlign: "right" }}>S&P 500</th>
+                <th style={{ ...header, textAlign: "right" }}>F&G</th>
+                <th style={{ ...header, textAlign: "right" }}>VIX</th>
+                <th style={{ ...header, textAlign: "right" }}>%&gt;50MA</th>
+                <th style={{ ...header, textAlign: "right" }}>%&gt;200MA</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recent.map((s) => (
+                <tr key={s.date}>
+                  <td style={cell}>{s.date}</td>
+                  <td style={{ ...cell, textAlign: "right" }}>{fmtPrice(s.sp500)}</td>
+                  <td style={{ ...cell, textAlign: "right" }}>{fmtNum(s.fearGreed, 1)}</td>
+                  <td style={{ ...cell, textAlign: "right" }}>{fmtNum(s.vix, 2)}</td>
+                  <td style={{ ...cell, textAlign: "right" }}>{fmtNum(s.spxAbove50, 1)}</td>
+                  <td style={{ ...cell, textAlign: "right" }}>{fmtNum(s.spxAbove200, 1)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    // ─── Main ───────────────────────────────────────────────────────────────
+    function MarketPulseDashboard() {
+      const [snapshots, setSnapshots] = useState([]);
+      const [loading, setLoading] = useState(true);
+      const [refreshing, setRefreshing] = useState(false);
+      const [error, setError] = useState(null);
+      const [lastRefresh, setLastRefresh] = useState(null);
+
+      const today = todayISO();
+      const latestSnap = snapshots[snapshots.length - 1];
+      const prevSnap = snapshots.length >= 2 ? snapshots[snapshots.length - 2] : null;
+
+      const load = useCallback(async (silent = false) => {
+        if (!silent) setRefreshing(true);
+        setError(null);
+        try {
+          const data = await fetchCSV();
+          setSnapshots(data);
+          setLastRefresh(new Date());
+        } catch (e) {
+          setError(`Couldn't load data: ${e.message}`);
+        } finally {
+          setRefreshing(false);
+          setLoading(false);
+        }
+      }, []);
+
+      useEffect(() => {
+        load();
+        const interval = setInterval(() => load(true), REFRESH_INTERVAL_MS);
+        return () => clearInterval(interval);
+      }, [load]);
+
+      const btnPrimary = {
+        fontFamily: "'DM Sans', sans-serif", fontSize: "13px",
+        fontWeight: 500, letterSpacing: "0.04em",
+        padding: "10px 20px", background: C.gold, color: C.bg,
+        border: "none", borderRadius: "2px", cursor: "pointer",
+        transition: "background 0.15s",
+      };
+
+      const lastRefreshLabel = lastRefresh
+        ? lastRefresh.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
+        : "—";
+
+      return (
+        <div style={{ background: C.bg, minHeight: "100vh", padding: "48px 32px" }}>
+          <div style={{ maxWidth: "1200px", margin: "0 auto" }}>
+            <header className="mb-12">
+              <div className="flex items-baseline justify-between flex-wrap gap-4">
+                <div>
+                  <div style={{
+                    fontFamily: "'JetBrains Mono', monospace", fontSize: "11px",
+                    color: C.gold, letterSpacing: "0.2em",
+                    textTransform: "uppercase", marginBottom: "8px",
+                  }}>— Market Pulse —</div>
+                  <h1 style={{
+                    fontFamily: "'Fraunces', serif", fontSize: "44px",
+                    fontWeight: 500, lineHeight: 1.1, letterSpacing: "-0.02em",
+                    color: C.text, margin: 0,
+                  }}>Daily breadth & sentiment</h1>
+                  <div style={{
+                    fontFamily: "'DM Sans', sans-serif", fontSize: "14px",
+                    color: C.textMuted, marginTop: "10px",
+                  }}>{fmtDateLong(today)}</div>
+                </div>
+
+                <div className="flex items-center gap-3 flex-wrap">
+                  {lastRefresh && (
+                    <span style={{
+                      fontFamily: "'JetBrains Mono', monospace", fontSize: "11px",
+                      color: C.textFaint,
+                    }}>Last refresh · {lastRefreshLabel}</span>
+                  )}
+                  <button
+                    onClick={() => load(false)}
+                    disabled={refreshing}
+                    style={{ ...btnPrimary, opacity: refreshing ? 0.6 : 1 }}
+                  >
+                    {refreshing ? "Refreshing…" : "Refresh"}
+                  </button>
+                </div>
+              </div>
+
+              {error && (
+                <div style={{
+                  marginTop: "16px", padding: "12px 16px",
+                  background: "rgba(197, 82, 74, 0.1)",
+                  border: `1px solid ${C.red}`, borderRadius: "2px",
+                  fontSize: "13px", color: C.red,
+                  fontFamily: "'JetBrains Mono', monospace",
+                }}>{error}</div>
+              )}
+            </header>
+
+            <section className="mb-12">
+              <div className="flex items-baseline justify-between mb-5">
+                <h2 style={{
+                  fontFamily: "'Fraunces', serif", fontSize: "22px",
+                  fontWeight: 500, margin: 0, letterSpacing: "-0.01em",
+                }}>
+                  {loading ? "Loading…" : latestSnap ? "Latest reading" : "No data"}
+                </h2>
+                {latestSnap && (
+                  <span style={{
+                    fontFamily: "'JetBrains Mono', monospace", fontSize: "11px",
+                    color: C.textMuted,
+                  }}>{latestSnap.date}</span>
+                )}
+              </div>
+
+              {latestSnap && (
+                <>
+                  <SP500Banner snap={latestSnap} prevSnap={prevSnap} />
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                    <MetricCard
+                      label="Fear & Greed" ticker="CNN"
+                      value={latestSnap.fearGreed}
+                      status={fgStatus(latestSnap.fearGreed)}
+                      description="CNN's composite of 7 sentiment signals. 0 = extreme fear, 100 = extreme greed."
+                    />
+                    <MetricCard
+                      label="Volatility" ticker="^VIX"
+                      value={latestSnap.vix}
+                      status={vixStatus(latestSnap.vix)}
+                      description="CBOE Volatility Index — implied 30-day S&P 500 volatility from options."
+                    />
+                    <MetricCard
+                      label="% above 50-day MA" ticker="$S5FI"
+                      value={latestSnap.spxAbove50}
+                      status={breadthStatus(latestSnap.spxAbove50)}
+                      description="Share of S&P 500 names trading above their 50-day SMA. Short-term breadth."
+                    />
+                    <MetricCard
+                      label="% above 200-day MA" ticker="$S5TH"
+                      value={latestSnap.spxAbove200}
+                      status={breadthStatus(latestSnap.spxAbove200)}
+                      description="Share of S&P 500 names trading above their 200-day SMA. Long-term breadth."
+                    />
+                  </div>
+                </>
+              )}
+            </section>
+
+            {snapshots.length >= 2 && (
+              <section className="mb-12">
+                <MarketBreadthChart data={snapshots} />
+              </section>
+            )}
+
+            {snapshots.length >= 2 && (
+              <section className="mb-12">
+                <h2 style={{
+                  fontFamily: "'Fraunces', serif", fontSize: "22px",
+                  fontWeight: 500, margin: "0 0 20px 0", letterSpacing: "-0.01em",
+                }}>
+                  Sentiment & volatility ·{" "}
+                  <span style={{ color: C.textMuted, fontSize: "16px" }}>
+                    {snapshots.length} days
+                  </span>
+                </h2>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <MiniChart
+                    data={snapshots} dataKey="fearGreed" color={C.gold}
+                    label="Fear & Greed" domain={[0, 100]}
+                    refLines={[{ y: 25 }, { y: 50 }, { y: 75 }]}
+                  />
+                  <MiniChart
+                    data={snapshots} dataKey="vix" color={C.red}
+                    label="VIX" domain={["auto", "auto"]}
+                    refLines={[{ y: 20 }, { y: 30 }]}
+                  />
+                </div>
+              </section>
+            )}
+
+            {snapshots.length > 0 && (
+              <section className="mb-12">
+                <h2 style={{
+                  fontFamily: "'Fraunces', serif", fontSize: "22px",
+                  fontWeight: 500, margin: "0 0 20px 0", letterSpacing: "-0.01em",
+                }}>
+                  History ·{" "}
+                  <span style={{ color: C.textMuted, fontSize: "16px" }}>
+                    {snapshots.length} {snapshots.length === 1 ? "snapshot" : "snapshots"} total
+                  </span>
+                </h2>
+                <HistoryTable snapshots={snapshots} />
+                {snapshots.length > 14 && (
+                  <div style={{
+                    fontSize: "12px", color: C.textMuted, marginTop: "12px",
+                    textAlign: "right",
+                  }}>
+                    Showing 14 most recent ·{" "}
+                    <a href={RAW_URL} target="_blank" rel="noreferrer" style={{ color: C.gold }}>
+                      view full CSV
+                    </a>
+                  </div>
+                )}
+              </section>
+            )}
+
+            <footer style={{
+              marginTop: "64px", paddingTop: "24px",
+              borderTop: `1px solid ${C.border}`, fontSize: "12px",
+              color: C.textFaint, lineHeight: 1.7,
+            }}>
+              <div style={{ marginBottom: "8px" }}>
+                Auto-refreshes every 15 minutes. Data collected daily by GitHub Actions
+                (weekdays at 6pm ET) from{" "}
+                <a href={`https://github.com/${GH_USER}/${GH_REPO}`} target="_blank" rel="noreferrer" style={{ color: C.textMuted }}>
+                  {GH_USER}/{GH_REPO}
+                </a>.
+              </div>
+              <div>
+                Sources: Yahoo Finance (^GSPC, ^VIX) · CNN Business · Barchart ($S5FI, $S5TH).
+              </div>
+            </footer>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<MarketPulseDashboard />);
+  </script>
+</body>
+</html>
