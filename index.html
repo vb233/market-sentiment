@@ -46,21 +46,11 @@
     const RAW_URL = `https://raw.githubusercontent.com/${GH_USER}/${GH_REPO}/refs/heads/${GH_BRANCH}/${GH_PATH}`;
     const REFRESH_INTERVAL_MS = 15 * 60 * 1000;
     const SEARCH_STORAGE_KEY = "stock-search-history-v1";
+    const AV_KEY_STORAGE = "alphavantage-key-v1";
     const MAX_HISTORY_ROWS = 500;
 
-    // Yahoo Finance quote endpoint (needs CORS proxy from browser)
-    const YAHOO_QUOTE_BASE = "https://query1.finance.yahoo.com/v7/finance/quote";
-    const YAHOO_FIELDS = [
-      "longName", "shortName", "regularMarketPrice",
-      "trailingPE", "forwardPE", "trailingPegRatio",
-      "heldPercentInstitutions",
-    ].join(",");
-
-    const PROXIES = (target) => [
-      `https://corsproxy.io/?${encodeURIComponent(target)}`,
-      `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`,
-      `https://r.jina.ai/${target}`,
-    ];
+    const AV_BASE = "https://www.alphavantage.co/query";
+    const AV_KEY_URL = "https://www.alphavantage.co/support/#api-key";
 
     // ────────────────────────────────────────────────────────────────────────
     const {
@@ -96,7 +86,7 @@
     const fmtPct = (v) =>
       v == null || isNaN(v) ? "—" : `${(Number(v) * 100).toFixed(1)}%`;
     const num = (v) => {
-      if (v === null || v === undefined || v === "") return null;
+      if (v === null || v === undefined || v === "" || v === "None") return null;
       const n = Number(v);
       return isNaN(n) ? null : n;
     };
@@ -168,38 +158,77 @@
       return parseCSV(await r.text());
     }
 
-    // ── Yahoo quote fetch (with CORS-proxy fallback) ───────────────────────
-    async function fetchYahooQuote(ticker) {
-      const target = `${YAHOO_QUOTE_BASE}?symbols=${encodeURIComponent(ticker)}&fields=${YAHOO_FIELDS}`;
-      const errors = [];
-      for (const url of PROXIES(target)) {
-        let host = "unknown";
-        try { host = new URL(url).hostname; } catch {}
-        try {
-          const res = await fetch(url, { cache: "no-store" });
-          if (!res.ok) {
-            errors.push(`${host}: HTTP ${res.status}`);
-            continue;
-          }
-          const text = await res.text();
-          let data;
-          try {
-            data = JSON.parse(text);
-          } catch {
-            errors.push(`${host}: invalid JSON`);
-            continue;
-          }
-          const results = data?.quoteResponse?.result;
-          if (!results || results.length === 0) {
-            errors.push(`${host}: no result for ${ticker}`);
-            continue;
-          }
-          return results[0];
-        } catch (e) {
-          errors.push(`${host}: ${e.message || "fetch failed"}`);
-        }
+    // ── Alpha Vantage stock fetch ───────────────────────────────────────────
+    async function fetchAVOverview(ticker, apiKey) {
+      const params = new URLSearchParams({
+        function: "OVERVIEW",
+        symbol: ticker,
+        apikey: apiKey,
+      });
+      const url = `${AV_BASE}?${params.toString()}`;
+      const res = await fetch(url);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} from Alpha Vantage`);
       }
-      throw new Error(`Couldn't fetch quote. ${errors.join(" · ")}`);
+      let data;
+      try {
+        data = await res.json();
+      } catch (e) {
+        throw new Error("Couldn't parse response from Alpha Vantage");
+      }
+
+      // Detect Alpha Vantage's various error/warning shapes
+      if (data?.Note) {
+        throw new Error("Rate limit reached. Free tier is 25 requests/day, 5/min.");
+      }
+      if (data?.Information) {
+        // Often returned when daily limit hit, or invalid key
+        if (data.Information.toLowerCase().includes("api key")) {
+          throw new Error("Invalid API key. Click 'Change key' to update it.");
+        }
+        throw new Error(data.Information);
+      }
+      if (data?.["Error Message"]) {
+        throw new Error(`Unknown ticker "${ticker}"`);
+      }
+      if (!data || Object.keys(data).length === 0 || !data.Symbol) {
+        throw new Error(`No data returned for "${ticker}". Check the ticker.`);
+      }
+
+      return data;
+    }
+
+    async function fetchAVQuote(ticker, apiKey) {
+      // GLOBAL_QUOTE for the latest price (separate endpoint from OVERVIEW)
+      const params = new URLSearchParams({
+        function: "GLOBAL_QUOTE",
+        symbol: ticker,
+        apikey: apiKey,
+      });
+      const url = `${AV_BASE}?${params.toString()}`;
+      try {
+        const res = await fetch(url);
+        if (!res.ok) return null;
+        const data = await res.json();
+        if (data?.Note || data?.Information || data?.["Error Message"]) return null;
+        const q = data?.["Global Quote"];
+        if (!q) return null;
+        return num(q["05. price"]);
+      } catch {
+        return null;
+      }
+    }
+
+    function parseAVPercent(s) {
+      // Alpha Vantage returns institutional pct as a string like "0.6432"
+      // (already a decimal fraction), or sometimes "64.32%".
+      if (s == null || s === "" || s === "None") return null;
+      const stripped = String(s).replace("%", "").trim();
+      const n = Number(stripped);
+      if (isNaN(n)) return null;
+      // If they returned 64.32 (a whole-percent number), normalize to fraction.
+      // If they returned 0.6432 (a fraction already), keep it.
+      return n > 1 ? n / 100 : n;
     }
 
     // ── Search history (browser-local) ──────────────────────────────────────
@@ -213,7 +242,6 @@
         return [];
       }
     }
-
     function saveSearchHistory(history) {
       try {
         const trimmed = history.slice(0, MAX_HISTORY_ROWS);
@@ -222,15 +250,28 @@
         console.error("Failed to save search history", e);
       }
     }
-
     function appendSearch(entry) {
       const history = loadSearchHistory();
-      history.unshift(entry); // most recent first
+      history.unshift(entry);
       saveSearchHistory(history);
       return history;
     }
 
-    // ─── Reusable components ────────────────────────────────────────────────
+    function loadApiKey() {
+      try {
+        return localStorage.getItem(AV_KEY_STORAGE) || "";
+      } catch {
+        return "";
+      }
+    }
+    function saveApiKey(key) {
+      try {
+        if (key) localStorage.setItem(AV_KEY_STORAGE, key);
+        else localStorage.removeItem(AV_KEY_STORAGE);
+      } catch {}
+    }
+
+    // ─── Reusable dashboard components (unchanged) ──────────────────────────
     function SP500Banner({ snap, prevSnap }) {
       const v = snap?.sp500;
       const prev = prevSnap?.sp500;
@@ -366,15 +407,11 @@
                 <YAxis yAxisId="price" orientation="left" domain={["auto", "auto"]} tick={{ fontSize: 11, fill: C.gold }} axisLine={{ stroke: C.border }} tickLine={{ stroke: C.border }} width={56} tickFormatter={(v) => Number(v).toLocaleString("en-US", { maximumFractionDigits: 0 })} />
                 <YAxis yAxisId="pct" orientation="right" domain={[0, 100]} tick={{ fontSize: 11, fill: C.textFaint }} axisLine={{ stroke: C.border }} tickLine={{ stroke: C.border }} width={36} tickFormatter={(v) => `${v}`} />
                 <ReferenceLine y={50} yAxisId="pct" stroke={C.borderStrong} strokeDasharray="3 4" strokeWidth={1} />
-                <Tooltip
-                  contentStyle={{ background: C.bg, border: `1px solid ${C.borderStrong}`, borderRadius: "2px", fontFamily: "JetBrains Mono", fontSize: "12px", color: C.text }}
-                  labelFormatter={fmtDate}
-                  formatter={(v, name) => {
-                    if (v == null) return ["—", name];
-                    if (name === "S&P 500") return [fmtPrice(v), name];
-                    return [`${Number(v).toFixed(1)}%`, name];
-                  }}
-                />
+                <Tooltip contentStyle={{ background: C.bg, border: `1px solid ${C.borderStrong}`, borderRadius: "2px", fontFamily: "JetBrains Mono", fontSize: "12px", color: C.text }} labelFormatter={fmtDate} formatter={(v, name) => {
+                  if (v == null) return ["—", name];
+                  if (name === "S&P 500") return [fmtPrice(v), name];
+                  return [`${Number(v).toFixed(1)}%`, name];
+                }} />
                 <Legend wrapperStyle={{ fontFamily: "'DM Sans', sans-serif", fontSize: "12px", paddingTop: "8px" }} iconType="plainline" />
                 <Line yAxisId="price" type="monotone" dataKey="sp500" name="S&P 500" stroke={C.gold} strokeWidth={2} dot={false} activeDot={{ r: 3, fill: C.gold, stroke: C.bg, strokeWidth: 1 }} connectNulls />
                 <Line yAxisId="pct" type="monotone" dataKey="spxAbove50" name="% above 50-day" stroke={C.blue} strokeWidth={1.5} dot={false} activeDot={{ r: 3, fill: C.blue, stroke: C.bg, strokeWidth: 1 }} connectNulls />
@@ -466,8 +503,107 @@
       );
     }
 
+    // ─── API key strip ──────────────────────────────────────────────────────
+    function ApiKeyStrip({ apiKey, onChange }) {
+      const [editing, setEditing] = useState(!apiKey);
+      const [draft, setDraft] = useState(apiKey || "");
+
+      function handleSave() {
+        const cleaned = draft.trim();
+        onChange(cleaned);
+        setEditing(false);
+      }
+
+      const inputStyle = {
+        flex: "1 1 240px",
+        padding: "8px 12px",
+        background: C.bg,
+        border: `1px solid ${C.borderStrong}`,
+        borderRadius: "2px",
+        color: C.text,
+        fontFamily: "'JetBrains Mono', monospace",
+        fontSize: "12px",
+      };
+      const btnSmall = {
+        fontFamily: "'DM Sans', sans-serif", fontSize: "12px",
+        fontWeight: 500, padding: "8px 16px",
+        background: C.gold, color: C.bg,
+        border: "none", borderRadius: "2px", cursor: "pointer",
+      };
+      const btnSmallSec = {
+        ...btnSmall,
+        background: "transparent",
+        color: C.text,
+        border: `1px solid ${C.borderStrong}`,
+      };
+
+      if (!editing) {
+        return (
+          <div
+            className="mb-5 p-3 rounded-sm flex items-center justify-between gap-3 flex-wrap"
+            style={{
+              background: C.bg,
+              border: `1px solid ${C.border}`,
+              fontSize: "12px",
+              color: C.textMuted,
+              fontFamily: "'DM Sans', sans-serif",
+            }}
+          >
+            <div className="flex items-center gap-2">
+              <div style={{ width: "6px", height: "6px", background: C.green, borderRadius: "50%" }} />
+              <span>Alpha Vantage key configured</span>
+              <span style={{ color: C.textFaint }}>· ending in {apiKey.slice(-4)}</span>
+            </div>
+            <button onClick={() => { setDraft(apiKey); setEditing(true); }} style={btnSmallSec}>
+              Change key
+            </button>
+          </div>
+        );
+      }
+
+      return (
+        <div
+          className="mb-5 p-4 rounded-sm"
+          style={{
+            background: C.bg,
+            border: `1px dashed ${C.borderStrong}`,
+          }}
+        >
+          <div style={{
+            fontSize: "12px",
+            color: C.textMuted,
+            marginBottom: "10px",
+            lineHeight: 1.6,
+            fontFamily: "'DM Sans', sans-serif",
+          }}>
+            Stock lookup uses Alpha Vantage (free tier: 25 requests/day). Get a free
+            key from{" "}
+            <a href={AV_KEY_URL} target="_blank" rel="noreferrer" style={{ color: C.gold }}>
+              alphavantage.co/support/#api-key
+            </a>
+            {" "}— takes 30 seconds, no credit card. Stored locally in your browser only.
+          </div>
+          <div className="flex gap-2 flex-wrap">
+            <input
+              type="text"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              placeholder="paste your API key here"
+              style={inputStyle}
+            />
+            <button onClick={handleSave} disabled={!draft.trim()} style={{ ...btnSmall, opacity: draft.trim() ? 1 : 0.5 }}>
+              Save
+            </button>
+            {apiKey && (
+              <button onClick={() => setEditing(false)} style={btnSmallSec}>Cancel</button>
+            )}
+          </div>
+        </div>
+      );
+    }
+
     // ─── Stock Lookup section ───────────────────────────────────────────────
-    function StockLookup({ history, onSearch }) {
+    function StockLookup({ history, onSearch, apiKey, onApiKeyChange }) {
       const [ticker, setTicker] = useState("");
       const [running, setRunning] = useState(false);
       const [result, setResult] = useState(null);
@@ -475,31 +611,38 @@
 
       const cleanedTicker = ticker.trim().toUpperCase();
 
-      // Past searches for the typed ticker (live as user types)
       const pastForTicker = useMemo(() => {
         if (!cleanedTicker) return [];
-        return history
-          .filter((h) => h.ticker === cleanedTicker)
-          .slice(0, 5);
+        return history.filter((h) => h.ticker === cleanedTicker).slice(0, 5);
       }, [cleanedTicker, history]);
 
       async function runLookup() {
         if (!cleanedTicker) return;
+        if (!apiKey) {
+          setError("Please save an Alpha Vantage API key first (top of this section).");
+          return;
+        }
         setRunning(true);
         setError(null);
         setResult(null);
         try {
-          const q = await fetchYahooQuote(cleanedTicker);
+          // OVERVIEW gives us fundamentals; GLOBAL_QUOTE gives latest price.
+          // Run in parallel; if quote fails we just show fundamentals without price.
+          const [overview, livePrice] = await Promise.all([
+            fetchAVOverview(cleanedTicker, apiKey),
+            fetchAVQuote(cleanedTicker, apiKey),
+          ]);
+
           const entry = {
             timestamp: new Date().toISOString(),
             date: todayISO(),
             ticker: cleanedTicker,
-            name: q.longName || q.shortName || cleanedTicker,
-            price: num(q.regularMarketPrice),
-            trailingPE: num(q.trailingPE),
-            forwardPE: num(q.forwardPE),
-            forwardPEG: num(q.trailingPegRatio), // Yahoo's PEG is 5y forward
-            instHeldPct: num(q.heldPercentInstitutions),
+            name: overview.Name || cleanedTicker,
+            price: livePrice,
+            trailingPE: num(overview.PERatio),
+            forwardPE: num(overview.ForwardPE),
+            forwardPEG: num(overview.PEGRatio),
+            instHeldPct: parseAVPercent(overview.PercentInstitutions),
           };
           setResult(entry);
           onSearch(entry);
@@ -549,6 +692,8 @@
             fontWeight: 500, margin: "0 0 16px 0", letterSpacing: "-0.01em",
           }}>Look up a ticker</h2>
 
+          <ApiKeyStrip apiKey={apiKey} onChange={onApiKeyChange} />
+
           <div className="flex gap-2 flex-wrap items-center">
             <input
               type="text"
@@ -560,8 +705,8 @@
             />
             <button
               onClick={runLookup}
-              disabled={running || !cleanedTicker}
-              style={{ ...btnPrimary, opacity: running || !cleanedTicker ? 0.5 : 1 }}
+              disabled={running || !cleanedTicker || !apiKey}
+              style={{ ...btnPrimary, opacity: running || !cleanedTicker || !apiKey ? 0.5 : 1 }}
             >
               {running ? "Running…" : "Run"}
             </button>
@@ -577,18 +722,16 @@
             }}>{error}</div>
           )}
 
-          {/* Live result */}
           {result && (
             <div className="mt-6 grid grid-cols-2 md:grid-cols-5 gap-3">
               <ResultTile label={result.ticker} sub={result.name} primary={fmtPrice(result.price)} />
               <ResultTile label="Current P/E" primary={fmtNum(result.trailingPE, 2)} />
               <ResultTile label="Forward P/E" primary={fmtNum(result.forwardPE, 2)} />
-              <ResultTile label="Forward PEG" primary={fmtNum(result.forwardPEG, 2)} sub="5y forward (Yahoo)" />
+              <ResultTile label="PEG" primary={fmtNum(result.forwardPEG, 2)} sub="Alpha Vantage" />
               <ResultTile label="Inst. held" primary={fmtPct(result.instHeldPct)} />
             </div>
           )}
 
-          {/* Past searches for the typed ticker, shown when ticker is typed but no result yet */}
           {!running && !result && cleanedTicker && pastForTicker.length > 0 && (
             <div className="mt-6">
               <div style={{
@@ -661,7 +804,7 @@
                 <th style={{ ...header, textAlign: "right" }}>Price</th>
                 <th style={{ ...header, textAlign: "right" }}>P/E</th>
                 <th style={{ ...header, textAlign: "right" }}>Fwd P/E</th>
-                <th style={{ ...header, textAlign: "right" }}>Fwd PEG</th>
+                <th style={{ ...header, textAlign: "right" }}>PEG</th>
                 <th style={{ ...header, textAlign: "right" }}>Inst. %</th>
               </tr>
             </thead>
@@ -682,7 +825,7 @@
       );
     }
 
-    // ─── Search history section (full log) ──────────────────────────────────
+    // ─── Search history section ─────────────────────────────────────────────
     function SearchHistorySection({ history, onClear, onExport }) {
       const recent = history.slice(0, 50);
       const cell = {
@@ -703,7 +846,6 @@
         color: C.text, border: `1px solid ${C.borderStrong}`,
         borderRadius: "2px", cursor: "pointer",
       };
-
       return (
         <section className="mb-12">
           <div className="flex items-baseline justify-between flex-wrap gap-2 mb-5">
@@ -744,7 +886,7 @@
                     <th style={{ ...header, textAlign: "right" }}>Price</th>
                     <th style={{ ...header, textAlign: "right" }}>P/E</th>
                     <th style={{ ...header, textAlign: "right" }}>Fwd P/E</th>
-                    <th style={{ ...header, textAlign: "right" }}>Fwd PEG</th>
+                    <th style={{ ...header, textAlign: "right" }}>PEG</th>
                     <th style={{ ...header, textAlign: "right" }}>Inst. %</th>
                   </tr>
                 </thead>
@@ -788,6 +930,7 @@
       const [error, setError] = useState(null);
       const [lastRefresh, setLastRefresh] = useState(null);
       const [searchHistory, setSearchHistory] = useState(() => loadSearchHistory());
+      const [apiKey, setApiKey] = useState(() => loadApiKey());
 
       const today = todayISO();
       const latestSnap = snapshots[snapshots.length - 1];
@@ -818,15 +961,13 @@
         const updated = appendSearch(entry);
         setSearchHistory(updated);
       }
-
       function handleClearHistory() {
         if (!window.confirm("Delete all search history? This can't be undone.")) return;
         localStorage.removeItem(SEARCH_STORAGE_KEY);
         setSearchHistory([]);
       }
-
       function handleExportHistory() {
-        const headers = "timestamp,date,ticker,name,price,trailing_pe,forward_pe,forward_peg,inst_held_pct\n";
+        const headers = "timestamp,date,ticker,name,price,trailing_pe,forward_pe,peg,inst_held_pct\n";
         const rows = searchHistory.map((r) => {
           const safeName = (r.name || "").replace(/,/g, " ").replace(/"/g, "'");
           return [
@@ -843,6 +984,10 @@
         a.click();
         URL.revokeObjectURL(url);
       }
+      function handleApiKeyChange(key) {
+        setApiKey(key);
+        saveApiKey(key);
+      }
 
       const btnPrimary = {
         fontFamily: "'DM Sans', sans-serif", fontSize: "13px",
@@ -850,7 +995,6 @@
         padding: "10px 20px", background: C.gold, color: C.bg,
         border: "none", borderRadius: "2px", cursor: "pointer",
       };
-
       const lastRefreshLabel = lastRefresh
         ? lastRefresh.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
         : "—";
@@ -884,11 +1028,7 @@
                       color: C.textFaint,
                     }}>Last refresh · {lastRefreshLabel}</span>
                   )}
-                  <button
-                    onClick={() => load(false)}
-                    disabled={refreshing}
-                    style={{ ...btnPrimary, opacity: refreshing ? 0.6 : 1 }}
-                  >
+                  <button onClick={() => load(false)} disabled={refreshing} style={{ ...btnPrimary, opacity: refreshing ? 0.6 : 1 }}>
                     {refreshing ? "Refreshing…" : "Refresh"}
                   </button>
                 </div>
@@ -926,30 +1066,10 @@
                 <>
                   <SP500Banner snap={latestSnap} prevSnap={prevSnap} />
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-                    <MetricCard
-                      label="Fear & Greed" ticker="CNN"
-                      value={latestSnap.fearGreed}
-                      status={fgStatus(latestSnap.fearGreed)}
-                      description="CNN's composite of 7 sentiment signals. 0 = extreme fear, 100 = extreme greed."
-                    />
-                    <MetricCard
-                      label="Volatility" ticker="^VIX"
-                      value={latestSnap.vix}
-                      status={vixStatus(latestSnap.vix)}
-                      description="CBOE Volatility Index — implied 30-day S&P 500 volatility from options."
-                    />
-                    <MetricCard
-                      label="% above 50-day MA" ticker="$S5FI"
-                      value={latestSnap.spxAbove50}
-                      status={breadthStatus(latestSnap.spxAbove50)}
-                      description="Share of S&P 500 names trading above their 50-day SMA. Short-term breadth."
-                    />
-                    <MetricCard
-                      label="% above 200-day MA" ticker="$S5TH"
-                      value={latestSnap.spxAbove200}
-                      status={breadthStatus(latestSnap.spxAbove200)}
-                      description="Share of S&P 500 names trading above their 200-day SMA. Long-term breadth."
-                    />
+                    <MetricCard label="Fear & Greed" ticker="CNN" value={latestSnap.fearGreed} status={fgStatus(latestSnap.fearGreed)} description="CNN's composite of 7 sentiment signals. 0 = extreme fear, 100 = extreme greed." />
+                    <MetricCard label="Volatility" ticker="^VIX" value={latestSnap.vix} status={vixStatus(latestSnap.vix)} description="CBOE Volatility Index — implied 30-day S&P 500 volatility from options." />
+                    <MetricCard label="% above 50-day MA" ticker="$S5FI" value={latestSnap.spxAbove50} status={breadthStatus(latestSnap.spxAbove50)} description="Share of S&P 500 names trading above their 50-day SMA. Short-term breadth." />
+                    <MetricCard label="% above 200-day MA" ticker="$S5TH" value={latestSnap.spxAbove200} status={breadthStatus(latestSnap.spxAbove200)} description="Share of S&P 500 names trading above their 200-day SMA. Long-term breadth." />
                   </div>
                 </>
               )}
@@ -973,16 +1093,8 @@
                   </span>
                 </h2>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <MiniChart
-                    data={snapshots} dataKey="fearGreed" color={C.gold}
-                    label="Fear & Greed" domain={[0, 100]}
-                    refLines={[{ y: 25 }, { y: 50 }, { y: 75 }]}
-                  />
-                  <MiniChart
-                    data={snapshots} dataKey="vix" color={C.red}
-                    label="VIX" domain={["auto", "auto"]}
-                    refLines={[{ y: 20 }, { y: 30 }]}
-                  />
+                  <MiniChart data={snapshots} dataKey="fearGreed" color={C.gold} label="Fear & Greed" domain={[0, 100]} refLines={[{ y: 25 }, { y: 50 }, { y: 75 }]} />
+                  <MiniChart data={snapshots} dataKey="vix" color={C.red} label="VIX" domain={["auto", "auto"]} refLines={[{ y: 20 }, { y: 30 }]} />
                 </div>
               </section>
             )}
@@ -1013,10 +1125,13 @@
               </section>
             )}
 
-            {/* ── New: Stock Lookup ── */}
-            <StockLookup history={searchHistory} onSearch={handleSearchAppend} />
+            <StockLookup
+              history={searchHistory}
+              onSearch={handleSearchAppend}
+              apiKey={apiKey}
+              onApiKeyChange={handleApiKeyChange}
+            />
 
-            {/* ── New: Search history log ── */}
             <SearchHistorySection
               history={searchHistory}
               onClear={handleClearHistory}
@@ -1037,8 +1152,7 @@
               </div>
               <div>
                 Dashboard sources: Yahoo Finance (^GSPC, ^VIX) · CNN Business · Barchart ($S5FI, $S5TH).
-                Stock lookup sources: Yahoo Finance quote API (PE, PEG, institutional holdings).
-                Search history is stored locally in your browser.
+                Stock lookup powered by Alpha Vantage (free tier, your API key stored locally).
               </div>
             </footer>
           </div>
