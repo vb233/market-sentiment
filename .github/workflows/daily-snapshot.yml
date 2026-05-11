@@ -2,13 +2,14 @@ name: Daily market snapshot
 
 on:
   schedule:
-    # 22:00 UTC, Monday–Friday (~5–6pm ET, after US market close).
-    # GitHub may delay scheduled runs by up to ~30 min during peak load.
-    - cron: "0 22 * * 1-5"
-  workflow_dispatch:  # also allow manual runs from the Actions tab
+    # Run twice in case GitHub's cron skips one — the script is idempotent
+    # on date so a second run within the same day just overwrites the row.
+    - cron: "0 22 * * 1-5"   # 22:00 UTC (≈5–6pm ET) — primary attempt
+    - cron: "0 23 * * 1-5"   # 23:00 UTC (≈6–7pm ET) — backup attempt
+  workflow_dispatch:         # manual trigger from the Actions tab
 
 permissions:
-  contents: write   # needed to commit the updated CSV
+  contents: write
 
 jobs:
   snapshot:
@@ -28,7 +29,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Fetch today's snapshot
+      - name: Fetch today's snapshot (and backfill gaps)
         run: python fetch_snapshot.py
 
       - name: Commit updated CSV
