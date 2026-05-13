@@ -47,10 +47,15 @@
     const REFRESH_INTERVAL_MS = 15 * 60 * 1000;
     const SEARCH_STORAGE_KEY = "stock-search-history-v1";
     const AV_KEY_STORAGE = "alphavantage-key-v1";
+    const AV_CALL_LOG_KEY = "alphavantage-call-log-v1";
     const MAX_HISTORY_ROWS = 500;
 
     const AV_BASE = "https://www.alphavantage.co/query";
     const AV_KEY_URL = "https://www.alphavantage.co/support/#api-key";
+
+    // Alpha Vantage rate limits (free tier)
+    const AV_MAX_CALLS_PER_MINUTE = 5;
+    const AV_INTER_CALL_DELAY_MS = 1200;  // gap between sequential calls
 
     // ────────────────────────────────────────────────────────────────────────
     const {
@@ -85,12 +90,22 @@
       Number(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     const fmtPct = (v) =>
       v == null || isNaN(v) ? "—" : `${(Number(v) * 100).toFixed(1)}%`;
+    const fmtMarketCap = (v) => {
+      if (v == null || isNaN(v)) return "—";
+      const n = Number(v);
+      if (n >= 1e12) return `$${(n / 1e12).toFixed(2)}T`;
+      if (n >= 1e9) return `$${(n / 1e9).toFixed(2)}B`;
+      if (n >= 1e6) return `$${(n / 1e6).toFixed(0)}M`;
+      if (n >= 1e3) return `$${(n / 1e3).toFixed(0)}K`;
+      return `$${n.toFixed(0)}`;
+    };
     const num = (v) => {
       if (v === null || v === undefined || v === "" || v === "None") return null;
       const n = Number(v);
       return isNaN(n) ? null : n;
     };
     const todayISO = () => new Date().toISOString().split("T")[0];
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
     const fgStatus = (v) => {
       if (v == null || isNaN(v)) return { label: "—", color: C.textMuted };
@@ -158,76 +173,107 @@
       return parseCSV(await r.text());
     }
 
+    // ── Rate limit tracker ──────────────────────────────────────────────────
+    function loadCallLog() {
+      try {
+        const raw = localStorage.getItem(AV_CALL_LOG_KEY);
+        if (!raw) return [];
+        const arr = JSON.parse(raw);
+        return Array.isArray(arr) ? arr : [];
+      } catch {
+        return [];
+      }
+    }
+    function logApiCall() {
+      const now = Date.now();
+      const log = loadCallLog().filter((t) => now - t < 60_000);
+      log.push(now);
+      try {
+        localStorage.setItem(AV_CALL_LOG_KEY, JSON.stringify(log));
+      } catch {}
+    }
+    function checkRateLimit(neededCalls) {
+      const now = Date.now();
+      const log = loadCallLog().filter((t) => now - t < 60_000);
+      if (log.length + neededCalls > AV_MAX_CALLS_PER_MINUTE) {
+        // How long until enough calls drop off?
+        const oldest = log[0];
+        const secsLeft = Math.ceil((60_000 - (now - oldest)) / 1000);
+        return secsLeft;
+      }
+      return 0;
+    }
+
     // ── Alpha Vantage stock fetch ───────────────────────────────────────────
+    function detectAVError(data, ticker) {
+      if (data?.Note) {
+        return "Rate limit reached (5/min on free tier). Wait a minute.";
+      }
+      if (data?.Information) {
+        if (data.Information.toLowerCase().includes("api key")) {
+          return "Invalid API key. Click 'Change key' to update it.";
+        }
+        if (data.Information.toLowerCase().includes("daily")) {
+          return "Daily rate limit reached (25/day on free tier).";
+        }
+        return data.Information;
+      }
+      if (data?.["Error Message"]) {
+        return `Unknown ticker "${ticker}"`;
+      }
+      return null;
+    }
+
     async function fetchAVOverview(ticker, apiKey) {
       const params = new URLSearchParams({
-        function: "OVERVIEW",
-        symbol: ticker,
-        apikey: apiKey,
+        function: "OVERVIEW", symbol: ticker, apikey: apiKey,
       });
       const url = `${AV_BASE}?${params.toString()}`;
+      logApiCall();
       const res = await fetch(url);
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status} from Alpha Vantage`);
-      }
+      if (!res.ok) throw new Error(`HTTP ${res.status} from Alpha Vantage`);
       let data;
       try {
         data = await res.json();
-      } catch (e) {
-        throw new Error("Couldn't parse response from Alpha Vantage");
+      } catch {
+        throw new Error("Couldn't parse OVERVIEW response");
       }
-
-      // Detect Alpha Vantage's various error/warning shapes
-      if (data?.Note) {
-        throw new Error("Rate limit reached. Free tier is 25 requests/day, 5/min.");
-      }
-      if (data?.Information) {
-        // Often returned when daily limit hit, or invalid key
-        if (data.Information.toLowerCase().includes("api key")) {
-          throw new Error("Invalid API key. Click 'Change key' to update it.");
-        }
-        throw new Error(data.Information);
-      }
-      if (data?.["Error Message"]) {
-        throw new Error(`Unknown ticker "${ticker}"`);
-      }
+      const err = detectAVError(data, ticker);
+      if (err) throw new Error(err);
       if (!data || Object.keys(data).length === 0 || !data.Symbol) {
         throw new Error(`No data returned for "${ticker}". Check the ticker.`);
       }
-
       return data;
     }
 
     async function fetchAVQuote(ticker, apiKey) {
-      // GLOBAL_QUOTE for the latest price (separate endpoint from OVERVIEW)
       const params = new URLSearchParams({
-        function: "GLOBAL_QUOTE",
-        symbol: ticker,
-        apikey: apiKey,
+        function: "GLOBAL_QUOTE", symbol: ticker, apikey: apiKey,
       });
       const url = `${AV_BASE}?${params.toString()}`;
+      logApiCall();
+      const res = await fetch(url);
+      if (!res.ok) return { price: null, error: `HTTP ${res.status}` };
+      let data;
       try {
-        const res = await fetch(url);
-        if (!res.ok) return null;
-        const data = await res.json();
-        if (data?.Note || data?.Information || data?.["Error Message"]) return null;
-        const q = data?.["Global Quote"];
-        if (!q) return null;
-        return num(q["05. price"]);
+        data = await res.json();
       } catch {
-        return null;
+        return { price: null, error: "invalid JSON" };
       }
+      const err = detectAVError(data, ticker);
+      if (err) return { price: null, error: err };
+      const q = data?.["Global Quote"];
+      if (!q || Object.keys(q).length === 0) {
+        return { price: null, error: "no quote data" };
+      }
+      return { price: num(q["05. price"]), error: null };
     }
 
     function parseAVPercent(s) {
-      // Alpha Vantage returns institutional pct as a string like "0.6432"
-      // (already a decimal fraction), or sometimes "64.32%".
       if (s == null || s === "" || s === "None") return null;
       const stripped = String(s).replace("%", "").trim();
       const n = Number(stripped);
       if (isNaN(n)) return null;
-      // If they returned 64.32 (a whole-percent number), normalize to fraction.
-      // If they returned 0.6432 (a fraction already), keep it.
       return n > 1 ? n / 100 : n;
     }
 
@@ -576,7 +622,7 @@
             lineHeight: 1.6,
             fontFamily: "'DM Sans', sans-serif",
           }}>
-            Stock lookup uses Alpha Vantage (free tier: 25 requests/day). Get a free
+            Stock lookup uses Alpha Vantage (free tier: 25 requests/day, 5/min). Get a free
             key from{" "}
             <a href={AV_KEY_URL} target="_blank" rel="noreferrer" style={{ color: C.gold }}>
               alphavantage.co/support/#api-key
@@ -606,6 +652,7 @@
     function StockLookup({ history, onSearch, apiKey, onApiKeyChange }) {
       const [ticker, setTicker] = useState("");
       const [running, setRunning] = useState(false);
+      const [statusMsg, setStatusMsg] = useState(null);  // "Fetching OVERVIEW…" etc.
       const [result, setResult] = useState(null);
       const [error, setError] = useState(null);
 
@@ -622,23 +669,37 @@
           setError("Please save an Alpha Vantage API key first (top of this section).");
           return;
         }
+
+        // Check rate limit BEFORE making any calls (we'll make 2)
+        const waitSec = checkRateLimit(2);
+        if (waitSec > 0) {
+          setError(`Slow down — Alpha Vantage allows 5 calls/min. Wait ${waitSec}s and try again.`);
+          return;
+        }
+
         setRunning(true);
         setError(null);
         setResult(null);
+
         try {
-          // OVERVIEW gives us fundamentals; GLOBAL_QUOTE gives latest price.
-          // Run in parallel; if quote fails we just show fundamentals without price.
-          const [overview, livePrice] = await Promise.all([
-            fetchAVOverview(cleanedTicker, apiKey),
-            fetchAVQuote(cleanedTicker, apiKey),
-          ]);
+          // Sequential — fundamentals first, then price.
+          setStatusMsg("Fetching fundamentals…");
+          const overview = await fetchAVOverview(cleanedTicker, apiKey);
+
+          // Small delay so the 2nd call isn't back-to-back
+          await sleep(AV_INTER_CALL_DELAY_MS);
+
+          setStatusMsg("Fetching latest price…");
+          const quoteResult = await fetchAVQuote(cleanedTicker, apiKey);
 
           const entry = {
             timestamp: new Date().toISOString(),
             date: todayISO(),
             ticker: cleanedTicker,
             name: overview.Name || cleanedTicker,
-            price: livePrice,
+            price: quoteResult.price,
+            priceError: quoteResult.error,
+            marketCap: num(overview.MarketCapitalization),
             trailingPE: num(overview.PERatio),
             forwardPE: num(overview.ForwardPE),
             forwardPEG: num(overview.PEGRatio),
@@ -650,6 +711,7 @@
           setError(e.message);
         } finally {
           setRunning(false);
+          setStatusMsg(null);
         }
       }
 
@@ -708,7 +770,7 @@
               disabled={running || !cleanedTicker || !apiKey}
               style={{ ...btnPrimary, opacity: running || !cleanedTicker || !apiKey ? 0.5 : 1 }}
             >
-              {running ? "Running…" : "Run"}
+              {running ? (statusMsg || "Running…") : "Run"}
             </button>
           </div>
 
@@ -723,13 +785,27 @@
           )}
 
           {result && (
-            <div className="mt-6 grid grid-cols-2 md:grid-cols-5 gap-3">
-              <ResultTile label={result.ticker} sub={result.name} primary={fmtPrice(result.price)} />
-              <ResultTile label="Current P/E" primary={fmtNum(result.trailingPE, 2)} />
-              <ResultTile label="Forward P/E" primary={fmtNum(result.forwardPE, 2)} />
-              <ResultTile label="PEG" primary={fmtNum(result.forwardPEG, 2)} sub="Alpha Vantage" />
-              <ResultTile label="Inst. held" primary={fmtPct(result.instHeldPct)} />
-            </div>
+            <>
+              {result.priceError && (
+                <div style={{
+                  marginTop: "16px", padding: "8px 14px",
+                  background: "rgba(197, 160, 74, 0.08)",
+                  border: `1px solid ${C.yellow}`, borderRadius: "2px",
+                  fontSize: "11px", color: C.yellow,
+                  fontFamily: "'JetBrains Mono', monospace",
+                }}>
+                  Quote failed — fundamentals only. Reason: {result.priceError}
+                </div>
+              )}
+              <div className="mt-4 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+                <ResultTile label={result.ticker} sub={result.name} primary={fmtPrice(result.price)} />
+                <ResultTile label="Market Cap" primary={fmtMarketCap(result.marketCap)} />
+                <ResultTile label="Current P/E" primary={fmtNum(result.trailingPE, 2)} />
+                <ResultTile label="Forward P/E" primary={fmtNum(result.forwardPE, 2)} />
+                <ResultTile label="PEG" primary={fmtNum(result.forwardPEG, 2)} sub="Alpha Vantage" />
+                <ResultTile label="Inst. held" primary={fmtPct(result.instHeldPct)} />
+              </div>
+            </>
           )}
 
           {!running && !result && cleanedTicker && pastForTicker.length > 0 && (
@@ -769,7 +845,7 @@
             textTransform: "uppercase",
           }}>{label}</div>
           <div style={{
-            fontFamily: "'Fraunces', serif", fontSize: "26px",
+            fontFamily: "'Fraunces', serif", fontSize: "24px",
             fontWeight: 500, color: C.text, marginTop: "4px",
             letterSpacing: "-0.01em", lineHeight: 1.1,
           }}>{primary}</div>
@@ -797,11 +873,12 @@
       };
       return (
         <div className="rounded-sm overflow-x-auto" style={{ background: C.bg, border: `1px solid ${C.border}` }}>
-          <table className="w-full" style={{ minWidth: "640px" }}>
+          <table className="w-full" style={{ minWidth: "720px" }}>
             <thead>
               <tr>
                 <th style={header}>Date</th>
                 <th style={{ ...header, textAlign: "right" }}>Price</th>
+                <th style={{ ...header, textAlign: "right" }}>Mkt Cap</th>
                 <th style={{ ...header, textAlign: "right" }}>P/E</th>
                 <th style={{ ...header, textAlign: "right" }}>Fwd P/E</th>
                 <th style={{ ...header, textAlign: "right" }}>PEG</th>
@@ -813,6 +890,7 @@
                 <tr key={r.timestamp + "-" + i}>
                   <td style={cell}>{r.date}</td>
                   <td style={{ ...cell, textAlign: "right" }}>{fmtPrice(r.price)}</td>
+                  <td style={{ ...cell, textAlign: "right" }}>{fmtMarketCap(r.marketCap)}</td>
                   <td style={{ ...cell, textAlign: "right" }}>{fmtNum(r.trailingPE, 2)}</td>
                   <td style={{ ...cell, textAlign: "right" }}>{fmtNum(r.forwardPE, 2)}</td>
                   <td style={{ ...cell, textAlign: "right" }}>{fmtNum(r.forwardPEG, 2)}</td>
@@ -877,13 +955,14 @@
             </div>
           ) : (
             <div className="rounded-sm overflow-x-auto" style={{ background: C.bgCard, border: `1px solid ${C.border}` }}>
-              <table className="w-full" style={{ minWidth: "720px" }}>
+              <table className="w-full" style={{ minWidth: "820px" }}>
                 <thead>
                   <tr>
                     <th style={header}>Date</th>
                     <th style={header}>Ticker</th>
                     <th style={header}>Name</th>
                     <th style={{ ...header, textAlign: "right" }}>Price</th>
+                    <th style={{ ...header, textAlign: "right" }}>Mkt Cap</th>
                     <th style={{ ...header, textAlign: "right" }}>P/E</th>
                     <th style={{ ...header, textAlign: "right" }}>Fwd P/E</th>
                     <th style={{ ...header, textAlign: "right" }}>PEG</th>
@@ -895,10 +974,11 @@
                     <tr key={r.timestamp + "-" + i}>
                       <td style={cell}>{r.date}</td>
                       <td style={{ ...cell, color: C.gold }}>{r.ticker}</td>
-                      <td style={{ ...cell, color: C.textMuted, maxWidth: "240px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      <td style={{ ...cell, color: C.textMuted, maxWidth: "200px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                         {r.name || "—"}
                       </td>
                       <td style={{ ...cell, textAlign: "right" }}>{fmtPrice(r.price)}</td>
+                      <td style={{ ...cell, textAlign: "right" }}>{fmtMarketCap(r.marketCap)}</td>
                       <td style={{ ...cell, textAlign: "right" }}>{fmtNum(r.trailingPE, 2)}</td>
                       <td style={{ ...cell, textAlign: "right" }}>{fmtNum(r.forwardPE, 2)}</td>
                       <td style={{ ...cell, textAlign: "right" }}>{fmtNum(r.forwardPEG, 2)}</td>
@@ -967,13 +1047,17 @@
         setSearchHistory([]);
       }
       function handleExportHistory() {
-        const headers = "timestamp,date,ticker,name,price,trailing_pe,forward_pe,peg,inst_held_pct\n";
+        const headers = "timestamp,date,ticker,name,price,market_cap,trailing_pe,forward_pe,peg,inst_held_pct\n";
         const rows = searchHistory.map((r) => {
           const safeName = (r.name || "").replace(/,/g, " ").replace(/"/g, "'");
           return [
             r.timestamp, r.date, r.ticker, safeName,
-            r.price ?? "", r.trailingPE ?? "", r.forwardPE ?? "",
-            r.forwardPEG ?? "", r.instHeldPct ?? "",
+            r.price ?? "",
+            r.marketCap ?? "",
+            r.trailingPE ?? "",
+            r.forwardPE ?? "",
+            r.forwardPEG ?? "",
+            r.instHeldPct ?? "",
           ].join(",");
         }).join("\n");
         const blob = new Blob([headers + rows], { type: "text/csv" });
@@ -1045,7 +1129,6 @@
               )}
             </header>
 
-            {/* Latest reading */}
             <section className="mb-12">
               <div className="flex items-baseline justify-between mb-5">
                 <h2 style={{
@@ -1152,7 +1235,7 @@
               </div>
               <div>
                 Dashboard sources: Yahoo Finance (^GSPC, ^VIX) · CNN Business · Barchart ($S5FI, $S5TH).
-                Stock lookup powered by Alpha Vantage (free tier, your API key stored locally).
+                Stock lookup powered by Alpha Vantage (free tier: 25 requests/day, 5/min).
               </div>
             </footer>
           </div>
