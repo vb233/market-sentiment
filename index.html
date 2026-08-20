@@ -14,6 +14,15 @@
 <script crossorigin src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
 <script crossorigin src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script>
+  // Disable Babel's automatic script scanning IMMEDIATELY after loading.
+  // This prevents Babel from touching any scripts injected by browser extensions
+  // (Zotero, MetaMask, Grammarly, etc.). We will manually compile our one
+  // dashboard script below.
+  if (window.Babel && typeof window.Babel.disableScriptTags === "function") {
+    window.Babel.disableScriptTags();
+  }
+</script>
 <style>
   body { background: #0c0c0e; color: #e8e4dc; font-family: "DM Sans", sans-serif; margin: 0; }
   .recharts-text { font-family: "JetBrains Mono", monospace; }
@@ -21,8 +30,11 @@
 </style>
 </head>
 <body>
-<div id="root"></div>
-<script type="text/babel" data-presets="react">
+<div id="root">
+  <div style="padding:40px;color:#7a766f;font-family:sans-serif;">Loading dashboard...</div>
+</div>
+
+<script type="text/x-dashboard-jsx" id="dashboard-source">
 "use strict";
 
 var GH_USER = "vb233";
@@ -394,8 +406,7 @@ function MiniChart(props) {
 function ApiKeyStrip(props) {
   var apiKey = props.apiKey;
   var onChange = props.onChange;
-  var initialEditing = !apiKey;
-  var editing = useState(initialEditing);
+  var editing = useState(!apiKey);
   var draft = useState(apiKey || "");
   function save() {
     var cleaned = draft[0].trim();
@@ -422,7 +433,7 @@ function ApiKeyStrip(props) {
       <div style={{ fontSize: "12px", color: C.textMuted, marginBottom: "10px", lineHeight: 1.6 }}>
         Stock lookup uses Alpha Vantage (free tier: 25 requests/day, 5/min). Get a free key from{" "}
         <a href={AV_KEY_URL} target="_blank" rel="noreferrer" style={{ color: C.gold }}>alphavantage.co/support/#api-key</a>
-        {" "}\u2014 30 seconds, no credit card. Stored locally in your browser only.
+        {" \u2014 30 seconds, no credit card. Stored locally in your browser only."}
       </div>
       <div className="flex gap-2 flex-wrap">
         <input type="text" value={draft[0]} onChange={function(e){ draft[1](e.target.value); }}
@@ -519,7 +530,7 @@ function StockLookup(props) {
         <div>
           {result[0].priceError && (
             <div style={{ marginTop: "16px", padding: "8px 14px", background: "rgba(197, 160, 74, 0.08)", border: "1px solid " + C.yellow, borderRadius: "2px", fontSize: "11px", color: C.yellow, fontFamily: "'JetBrains Mono', monospace" }}>
-              Quote failed \u2014 fundamentals only. Reason: {result[0].priceError}
+              {"Quote failed \u2014 fundamentals only. Reason: "}{result[0].priceError}
             </div>
           )}
           <div className="mt-4 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
@@ -765,7 +776,7 @@ function Dashboard() {
         <header className="mb-12">
           <div className="flex items-baseline justify-between flex-wrap gap-4">
             <div>
-              <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: "11px", color: C.gold, letterSpacing: "0.2em", textTransform: "uppercase", marginBottom: "8px" }}>\u2014 Market Pulse \u2014</div>
+              <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: "11px", color: C.gold, letterSpacing: "0.2em", textTransform: "uppercase", marginBottom: "8px" }}>{"\u2014 Market Pulse \u2014"}</div>
               <h1 style={{ fontFamily: "'Fraunces', serif", fontSize: "44px", fontWeight: 500, lineHeight: 1.1, letterSpacing: "-0.02em", color: C.text, margin: 0 }}>Daily breadth & sentiment</h1>
               <div style={{ fontSize: "14px", color: C.textMuted, marginTop: "10px" }}>{fmtDateLong(today)}</div>
             </div>
@@ -793,7 +804,7 @@ function Dashboard() {
               <SP500Banner snap={latest} prevSnap={prev} />
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
                 <MetricCard label="Fear & Greed" ticker="CNN" value={latest.fearGreed} status={fgStatus(latest.fearGreed)} description="CNN's composite of 7 sentiment signals. 0 = extreme fear, 100 = extreme greed." />
-                <MetricCard label="Volatility" ticker="^VIX" value={latest.vix} status={vixStatus(latest.vix)} description="CBOE Volatility Index \u2014 implied 30-day S&P 500 volatility from options." />
+                <MetricCard label="Volatility" ticker="^VIX" value={latest.vix} status={vixStatus(latest.vix)} description={"CBOE Volatility Index \u2014 implied 30-day S&P 500 volatility from options."} />
                 <MetricCard label="% above 50-day MA" ticker="$S5FI" value={latest.spxAbove50} status={breadthStatus(latest.spxAbove50)} description="Share of S&P 500 names trading above their 50-day SMA. Short-term breadth." />
                 <MetricCard label="% above 200-day MA" ticker="$S5TH" value={latest.spxAbove200} status={breadthStatus(latest.spxAbove200)} description="Share of S&P 500 names trading above their 200-day SMA. Long-term breadth." />
               </div>
@@ -854,6 +865,34 @@ function Dashboard() {
 
 var root = ReactDOM.createRoot(document.getElementById("root"));
 root.render(<Dashboard />);
+</script>
+
+<script>
+  // Manually compile ONLY our dashboard script. Extension-injected scripts are ignored.
+  (function() {
+    function compileDashboard() {
+      try {
+        var src = document.getElementById("dashboard-source").textContent;
+        var compiled = window.Babel.transform(src, { presets: ["react"] }).code;
+        var s = document.createElement("script");
+        s.text = compiled;
+        document.body.appendChild(s);
+      } catch (err) {
+        console.error("Dashboard compile failed:", err);
+        var root = document.getElementById("root");
+        if (root) {
+          root.innerHTML = '<div style="padding:40px;color:#c5524a;font-family:sans-serif;">' +
+            '<h2>Dashboard failed to compile</h2><pre style="white-space:pre-wrap;font-size:12px;">' +
+            String(err.message || err) + '</pre></div>';
+        }
+      }
+    }
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", compileDashboard);
+    } else {
+      compileDashboard();
+    }
+  })();
 </script>
 </body>
 </html>
