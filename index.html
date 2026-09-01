@@ -1,0 +1,1761 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Market Pulse</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%93%8A%3C/text%3E%3C/svg%3E" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@400;500&family=DM+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+<script crossorigin src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+<style>
+  body { background: #0c0c0e; color: #e8e4dc; font-family: "DM Sans", sans-serif; margin: 0; }
+  .recharts-text { font-family: "JetBrains Mono", monospace; }
+  input::placeholder { color: #4a4742; }
+</style>
+</head>
+<body>
+<div id="root">
+  <div style="padding:40px;color:#7a766f;font-family:sans-serif;">Loading dashboard...</div>
+</div>
+<script>
+"use strict";
+
+var GH_USER = "vb233";
+var GH_REPO = "market-sentiment";
+var GH_BRANCH = "main";
+var GH_PATH = "data/snapshots.csv";
+var RAW_URL = "https://raw.githubusercontent.com/" + GH_USER + "/" + GH_REPO + "/refs/heads/" + GH_BRANCH + "/" + GH_PATH;
+var REFRESH_INTERVAL_MS = 15 * 60 * 1000;
+var SEARCH_KEY = "stock-search-history-v1";
+var AV_KEY = "alphavantage-key-v1";
+var CALL_LOG_KEY = "alphavantage-call-log-v1";
+var AV_BASE = "https://www.alphavantage.co/query";
+var AV_KEY_URL = "https://www.alphavantage.co/support/#api-key";
+var AV_MAX_PER_MIN = 5;
+var AV_GAP_MS = 1200;
+var MAX_HISTORY = 500;
+var C = {
+  bg: "#0c0c0e",
+  bgCard: "#15161a",
+  border: "#25262a",
+  borderStrong: "#33343a",
+  text: "#e8e4dc",
+  textMuted: "#7a766f",
+  textFaint: "#4a4742",
+  gold: "#d9b072",
+  red: "#c5524a",
+  green: "#6a9d76",
+  yellow: "#c5a04a",
+  blue: "#6e8db5"
+};
+var LC = Recharts.LineChart;
+var LN = Recharts.Line;
+var XA = Recharts.XAxis;
+var YA = Recharts.YAxis;
+var TT = Recharts.Tooltip;
+var RC = Recharts.ResponsiveContainer;
+var RL = Recharts.ReferenceLine;
+var LG = Recharts.Legend;
+var useState = React.useState;
+var useEffect = React.useEffect;
+var useCallback = React.useCallback;
+var useMemo = React.useMemo;
+function fmtDate(iso) {
+  var d = new Date(iso + "T12:00:00");
+  return d.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric"
+  });
+}
+function fmtDateLong(iso) {
+  var d = new Date(iso + "T12:00:00");
+  return d.toLocaleDateString("en-US", {
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric"
+  });
+}
+function fmtNum(v, digits) {
+  if (digits == null) digits = 1;
+  if (v == null || isNaN(v)) return "\u2014";
+  return Number(v).toFixed(digits);
+}
+function fmtPrice(v) {
+  if (v == null || isNaN(v)) return "\u2014";
+  return Number(v).toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  });
+}
+function fmtPct(v) {
+  if (v == null || isNaN(v)) return "\u2014";
+  return (Number(v) * 100).toFixed(1) + "%";
+}
+function fmtMcap(v) {
+  if (v == null || isNaN(v)) return "\u2014";
+  var n = Number(v);
+  if (n >= 1e12) return "$" + (n / 1e12).toFixed(2) + "T";
+  if (n >= 1e9) return "$" + (n / 1e9).toFixed(2) + "B";
+  if (n >= 1e6) return "$" + (n / 1e6).toFixed(0) + "M";
+  if (n >= 1e3) return "$" + (n / 1e3).toFixed(0) + "K";
+  return "$" + n.toFixed(0);
+}
+function num(v) {
+  if (v == null || v === "" || v === "None") return null;
+  var n = Number(v);
+  return isNaN(n) ? null : n;
+}
+function todayISO() {
+  return new Date().toISOString().split("T")[0];
+}
+function sleep(ms) {
+  return new Promise(function (r) {
+    setTimeout(r, ms);
+  });
+}
+function fgStatus(v) {
+  if (v == null || isNaN(v)) return {
+    label: "\u2014",
+    color: C.textMuted
+  };
+  if (v <= 25) return {
+    label: "Extreme Fear",
+    color: C.red
+  };
+  if (v <= 45) return {
+    label: "Fear",
+    color: "#d97a4a"
+  };
+  if (v <= 55) return {
+    label: "Neutral",
+    color: C.yellow
+  };
+  if (v <= 75) return {
+    label: "Greed",
+    color: C.green
+  };
+  return {
+    label: "Extreme Greed",
+    color: "#9aa86a"
+  };
+}
+function vixStatus(v) {
+  if (v == null || isNaN(v)) return {
+    label: "\u2014",
+    color: C.textMuted
+  };
+  if (v < 15) return {
+    label: "Calm",
+    color: C.green
+  };
+  if (v < 20) return {
+    label: "Normal",
+    color: "#9aa86a"
+  };
+  if (v < 30) return {
+    label: "Elevated",
+    color: C.yellow
+  };
+  if (v < 40) return {
+    label: "High",
+    color: "#d97a4a"
+  };
+  return {
+    label: "Panic",
+    color: C.red
+  };
+}
+function breadthStatus(v) {
+  if (v == null || isNaN(v)) return {
+    label: "\u2014",
+    color: C.textMuted
+  };
+  if (v < 20) return {
+    label: "Oversold",
+    color: C.red
+  };
+  if (v < 40) return {
+    label: "Weak",
+    color: "#d97a4a"
+  };
+  if (v < 60) return {
+    label: "Mixed",
+    color: C.yellow
+  };
+  if (v < 80) return {
+    label: "Healthy",
+    color: C.green
+  };
+  return {
+    label: "Overbought",
+    color: "#9aa86a"
+  };
+}
+function parseCSV(text) {
+  var lines = text.trim().split(/\r?\n/);
+  var headerIdx = -1;
+  for (var i = 0; i < lines.length; i++) {
+    if (lines[i].trim().toLowerCase().indexOf("date,") === 0) {
+      headerIdx = i;
+      break;
+    }
+  }
+  if (headerIdx < 0) headerIdx = 0;
+  if (lines.length - headerIdx < 2) return [];
+  var headers = lines[headerIdx].split(",").map(function (h) {
+    return h.trim();
+  });
+  var rows = [];
+  for (var j = headerIdx + 1; j < lines.length; j++) {
+    var line = lines[j].trim();
+    if (!line) continue;
+    var cells = line.split(",");
+    if (cells.length < headers.length) continue;
+    var r = {};
+    for (var k = 0; k < headers.length; k++) r[headers[k]] = (cells[k] || "").trim();
+    if (r.date && /^\d{4}-\d{2}-\d{2}$/.test(r.date)) {
+      rows.push({
+        date: r.date,
+        sp500: num(r.sp500),
+        fearGreed: num(r.fear_greed),
+        vix: num(r.vix),
+        spxAbove50: num(r.spx_above_50ma),
+        spxAbove200: num(r.spx_above_200ma)
+      });
+    }
+  }
+  rows.sort(function (a, b) {
+    return a.date.localeCompare(b.date);
+  });
+  return rows;
+}
+function fetchCSV() {
+  var url = RAW_URL + "?_=" + Date.now();
+  return fetch(url, {
+    cache: "no-store"
+  }).then(function (r) {
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return r.text();
+  }).then(parseCSV);
+}
+function loadCallLog() {
+  try {
+    var raw = localStorage.getItem(CALL_LOG_KEY);
+    if (!raw) return [];
+    var arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    return [];
+  }
+}
+function logCall() {
+  var now = Date.now();
+  var log = loadCallLog().filter(function (t) {
+    return now - t < 60000;
+  });
+  log.push(now);
+  try {
+    localStorage.setItem(CALL_LOG_KEY, JSON.stringify(log));
+  } catch (e) {}
+}
+function checkRate(needed) {
+  var now = Date.now();
+  var log = loadCallLog().filter(function (t) {
+    return now - t < 60000;
+  });
+  if (log.length + needed > AV_MAX_PER_MIN) {
+    var oldest = log[0];
+    return Math.ceil((60000 - (now - oldest)) / 1000);
+  }
+  return 0;
+}
+function detectAVError(data, ticker) {
+  if (data && data.Note) return "Rate limit reached (5/min). Wait a minute.";
+  if (data && data.Information) {
+    var info = data.Information.toLowerCase();
+    if (info.indexOf("api key") >= 0) return "Invalid API key. Click 'Change key' to update it.";
+    if (info.indexOf("daily") >= 0) return "Daily rate limit reached (25/day).";
+    return data.Information;
+  }
+  if (data && data["Error Message"]) return "Unknown ticker \"" + ticker + "\"";
+  return null;
+}
+function fetchOverview(ticker, apiKey) {
+  var url = AV_BASE + "?function=OVERVIEW&symbol=" + encodeURIComponent(ticker) + "&apikey=" + encodeURIComponent(apiKey);
+  logCall();
+  return fetch(url).then(function (r) {
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return r.json();
+  }).then(function (data) {
+    var err = detectAVError(data, ticker);
+    if (err) throw new Error(err);
+    if (!data || !data.Symbol) throw new Error("No data for \"" + ticker + "\"");
+    return data;
+  });
+}
+function fetchQuote(ticker, apiKey) {
+  var url = AV_BASE + "?function=GLOBAL_QUOTE&symbol=" + encodeURIComponent(ticker) + "&apikey=" + encodeURIComponent(apiKey);
+  logCall();
+  return fetch(url).then(function (r) {
+    if (!r.ok) return {
+      price: null,
+      error: "HTTP " + r.status
+    };
+    return r.json().then(function (data) {
+      var err = detectAVError(data, ticker);
+      if (err) return {
+        price: null,
+        error: err
+      };
+      var q = data && data["Global Quote"];
+      if (!q || Object.keys(q).length === 0) return {
+        price: null,
+        error: "no quote data"
+      };
+      return {
+        price: num(q["05. price"]),
+        error: null
+      };
+    });
+  }).catch(function (e) {
+    return {
+      price: null,
+      error: e.message
+    };
+  });
+}
+function parseAVPct(s) {
+  if (s == null || s === "" || s === "None") return null;
+  var n = Number(String(s).replace("%", "").trim());
+  if (isNaN(n)) return null;
+  return n > 1 ? n / 100 : n;
+}
+function loadHistory() {
+  try {
+    var raw = localStorage.getItem(SEARCH_KEY);
+    if (!raw) return [];
+    var arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    return [];
+  }
+}
+function saveHistory(h) {
+  try {
+    localStorage.setItem(SEARCH_KEY, JSON.stringify(h.slice(0, MAX_HISTORY)));
+  } catch (e) {}
+}
+function appendSearch(entry) {
+  var h = loadHistory();
+  h.unshift(entry);
+  saveHistory(h);
+  return h;
+}
+function loadApiKey() {
+  try {
+    return localStorage.getItem(AV_KEY) || "";
+  } catch (e) {
+    return "";
+  }
+}
+function saveApiKeyToLS(key) {
+  try {
+    if (key) localStorage.setItem(AV_KEY, key);else localStorage.removeItem(AV_KEY);
+  } catch (e) {}
+}
+function SP500Banner(props) {
+  var snap = props.snap;
+  var prev = props.prevSnap;
+  var v = snap && snap.sp500;
+  var pv = prev && prev.sp500;
+  var change = null,
+    changePct = null,
+    changeColor = C.textMuted;
+  if (v != null && pv != null && !isNaN(v) && !isNaN(pv)) {
+    change = v - pv;
+    changePct = change / pv * 100;
+    changeColor = change > 0 ? C.green : change < 0 ? C.red : C.textMuted;
+  }
+  return /*#__PURE__*/React.createElement("div", {
+    className: "p-7 rounded-sm flex items-center justify-between flex-wrap gap-6 mb-4",
+    style: {
+      background: C.bgCard,
+      border: "1px solid " + C.border,
+      borderLeft: "3px solid " + C.gold
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: "11px",
+      fontWeight: 600,
+      letterSpacing: "0.12em",
+      color: C.textMuted,
+      textTransform: "uppercase",
+      marginBottom: "8px"
+    }
+  }, "S&P 500 · ^GSPC"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "'Fraunces', serif",
+      fontSize: "64px",
+      lineHeight: 1,
+      fontWeight: 500,
+      color: C.text,
+      letterSpacing: "-0.02em"
+    }
+  }, fmtPrice(v))), change != null && /*#__PURE__*/React.createElement("div", {
+    className: "text-right"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "'JetBrains Mono', monospace",
+      fontSize: "20px",
+      fontWeight: 500,
+      color: changeColor
+    }
+  }, change >= 0 ? "\u25B2" : "\u25BC", " ", fmtPrice(Math.abs(change))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "'JetBrains Mono', monospace",
+      fontSize: "14px",
+      color: changeColor,
+      marginTop: "4px"
+    }
+  }, change >= 0 ? "+" : "\u2212", Math.abs(changePct).toFixed(2), "%"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: "11px",
+      color: C.textFaint,
+      marginTop: "8px",
+      letterSpacing: "0.06em",
+      textTransform: "uppercase"
+    }
+  }, "vs prior session")));
+}
+function MetricCard(props) {
+  return /*#__PURE__*/React.createElement("div", {
+    className: "p-6 rounded-sm flex flex-col",
+    style: {
+      background: C.bgCard,
+      border: "1px solid " + C.border,
+      minHeight: "180px"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-baseline justify-between mb-1"
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: "11px",
+      fontWeight: 600,
+      letterSpacing: "0.12em",
+      color: C.textMuted,
+      textTransform: "uppercase"
+    }
+  }, props.label), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: "'JetBrains Mono', monospace",
+      fontSize: "10px",
+      color: C.textFaint
+    }
+  }, props.ticker)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "'Fraunces', serif",
+      fontSize: "56px",
+      lineHeight: 1,
+      fontWeight: 500,
+      color: C.text,
+      letterSpacing: "-0.02em",
+      marginTop: "12px"
+    }
+  }, fmtNum(props.value, 1)), /*#__PURE__*/React.createElement("div", {
+    className: "mt-3 flex items-center gap-2"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: "6px",
+      height: "6px",
+      background: props.status.color,
+      borderRadius: "50%"
+    }
+  }), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: "13px",
+      fontWeight: 500,
+      color: props.status.color,
+      letterSpacing: "0.02em"
+    }
+  }, props.status.label)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: "12px",
+      color: C.textMuted,
+      marginTop: "10px",
+      lineHeight: 1.5
+    }
+  }, props.description));
+}
+function MarketBreadthChart(props) {
+  var data = props.data;
+  var last = data[data.length - 1] || {};
+  return /*#__PURE__*/React.createElement("div", {
+    className: "p-6 rounded-sm",
+    style: {
+      background: C.bgCard,
+      border: "1px solid " + C.border
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-baseline justify-between mb-4 flex-wrap gap-2"
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: "11px",
+      fontWeight: 600,
+      letterSpacing: "0.12em",
+      color: C.textMuted,
+      textTransform: "uppercase"
+    }
+  }, "Market Breadth"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "'Fraunces', serif",
+      fontSize: "20px",
+      fontWeight: 500,
+      marginTop: "4px",
+      letterSpacing: "-0.01em"
+    }
+  }, "S&P 500 vs share above moving averages")), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-5 text-right"
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: "10px",
+      color: C.textFaint,
+      letterSpacing: "0.08em",
+      textTransform: "uppercase"
+    }
+  }, "SPX"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "'JetBrains Mono', monospace",
+      fontSize: "13px",
+      color: C.gold
+    }
+  }, fmtPrice(last.sp500))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: "10px",
+      color: C.textFaint,
+      letterSpacing: "0.08em",
+      textTransform: "uppercase"
+    }
+  }, ">50d"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "'JetBrains Mono', monospace",
+      fontSize: "13px",
+      color: C.blue
+    }
+  }, fmtNum(last.spxAbove50, 1), "%")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: "10px",
+      color: C.textFaint,
+      letterSpacing: "0.08em",
+      textTransform: "uppercase"
+    }
+  }, ">200d"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "'JetBrains Mono', monospace",
+      fontSize: "13px",
+      color: C.green
+    }
+  }, fmtNum(last.spxAbove200, 1), "%")))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      height: "320px"
+    }
+  }, /*#__PURE__*/React.createElement(RC, {
+    width: "100%",
+    height: "100%"
+  }, /*#__PURE__*/React.createElement(LC, {
+    data: data,
+    margin: {
+      top: 10,
+      right: 12,
+      bottom: 5,
+      left: 0
+    }
+  }, /*#__PURE__*/React.createElement(XA, {
+    dataKey: "date",
+    tick: {
+      fontSize: 11,
+      fill: C.textFaint
+    },
+    tickFormatter: fmtDate,
+    axisLine: {
+      stroke: C.border
+    },
+    tickLine: {
+      stroke: C.border
+    },
+    interval: "preserveStartEnd",
+    minTickGap: 40
+  }), /*#__PURE__*/React.createElement(YA, {
+    yAxisId: "price",
+    orientation: "left",
+    domain: ["auto", "auto"],
+    tick: {
+      fontSize: 11,
+      fill: C.gold
+    },
+    axisLine: {
+      stroke: C.border
+    },
+    tickLine: {
+      stroke: C.border
+    },
+    width: 56,
+    tickFormatter: function (v) {
+      return Number(v).toLocaleString("en-US", {
+        maximumFractionDigits: 0
+      });
+    }
+  }), /*#__PURE__*/React.createElement(YA, {
+    yAxisId: "pct",
+    orientation: "right",
+    domain: [0, 100],
+    tick: {
+      fontSize: 11,
+      fill: C.textFaint
+    },
+    axisLine: {
+      stroke: C.border
+    },
+    tickLine: {
+      stroke: C.border
+    },
+    width: 36,
+    tickFormatter: function (v) {
+      return String(v);
+    }
+  }), /*#__PURE__*/React.createElement(RL, {
+    y: 50,
+    yAxisId: "pct",
+    stroke: C.borderStrong,
+    strokeDasharray: "3 4",
+    strokeWidth: 1
+  }), /*#__PURE__*/React.createElement(TT, {
+    contentStyle: {
+      background: C.bg,
+      border: "1px solid " + C.borderStrong,
+      borderRadius: "2px",
+      fontFamily: "JetBrains Mono",
+      fontSize: "12px",
+      color: C.text
+    },
+    labelFormatter: fmtDate,
+    formatter: function (v, name) {
+      if (v == null) return ["\u2014", name];
+      if (name === "S&P 500") return [fmtPrice(v), name];
+      return [Number(v).toFixed(1) + "%", name];
+    }
+  }), /*#__PURE__*/React.createElement(LG, {
+    wrapperStyle: {
+      fontSize: "12px",
+      paddingTop: "8px"
+    },
+    iconType: "plainline"
+  }), /*#__PURE__*/React.createElement(LN, {
+    yAxisId: "price",
+    type: "monotone",
+    dataKey: "sp500",
+    name: "S&P 500",
+    stroke: C.gold,
+    strokeWidth: 2,
+    dot: false,
+    connectNulls: true
+  }), /*#__PURE__*/React.createElement(LN, {
+    yAxisId: "pct",
+    type: "monotone",
+    dataKey: "spxAbove50",
+    name: "% above 50-day",
+    stroke: C.blue,
+    strokeWidth: 1.5,
+    dot: false,
+    connectNulls: true
+  }), /*#__PURE__*/React.createElement(LN, {
+    yAxisId: "pct",
+    type: "monotone",
+    dataKey: "spxAbove200",
+    name: "% above 200-day",
+    stroke: C.green,
+    strokeWidth: 1.5,
+    dot: false,
+    connectNulls: true
+  })))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: "11px",
+      color: C.textFaint,
+      marginTop: "8px",
+      lineHeight: 1.6
+    }
+  }, "Watch for divergences: S&P pushing higher while breadth lines fall is a classic warning sign that fewer names are participating in the rally."));
+}
+function MiniChart(props) {
+  var data = props.data;
+  var last = data[data.length - 1];
+  var lastValue = last ? last[props.dataKey] : null;
+  return /*#__PURE__*/React.createElement("div", {
+    className: "p-5 rounded-sm",
+    style: {
+      background: C.bgCard,
+      border: "1px solid " + C.border
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-baseline justify-between mb-2"
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: "11px",
+      fontWeight: 600,
+      letterSpacing: "0.12em",
+      color: C.textMuted,
+      textTransform: "uppercase"
+    }
+  }, props.label), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: "'JetBrains Mono', monospace",
+      fontSize: "14px",
+      color: C.text,
+      fontWeight: 500
+    }
+  }, fmtNum(lastValue, 1))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      height: "120px"
+    }
+  }, /*#__PURE__*/React.createElement(RC, {
+    width: "100%",
+    height: "100%"
+  }, /*#__PURE__*/React.createElement(LC, {
+    data: data,
+    margin: {
+      top: 5,
+      right: 5,
+      bottom: 5,
+      left: 0
+    }
+  }, /*#__PURE__*/React.createElement(XA, {
+    dataKey: "date",
+    tick: {
+      fontSize: 10,
+      fill: C.textFaint
+    },
+    tickFormatter: fmtDate,
+    axisLine: {
+      stroke: C.border
+    },
+    tickLine: {
+      stroke: C.border
+    },
+    interval: "preserveStartEnd",
+    minTickGap: 30
+  }), /*#__PURE__*/React.createElement(YA, {
+    domain: props.domain,
+    tick: {
+      fontSize: 10,
+      fill: C.textFaint
+    },
+    axisLine: {
+      stroke: C.border
+    },
+    tickLine: {
+      stroke: C.border
+    },
+    width: 32
+  }), (props.refLines || []).map(function (rl, i) {
+    return /*#__PURE__*/React.createElement(RL, {
+      key: i,
+      y: rl.y,
+      stroke: C.borderStrong,
+      strokeDasharray: "2 3",
+      strokeWidth: 1
+    });
+  }), /*#__PURE__*/React.createElement(TT, {
+    contentStyle: {
+      background: C.bg,
+      border: "1px solid " + C.borderStrong,
+      borderRadius: "2px",
+      fontFamily: "JetBrains Mono",
+      fontSize: "12px",
+      color: C.text
+    },
+    labelFormatter: fmtDate,
+    formatter: function (v) {
+      return v != null ? Number(v).toFixed(2) : "\u2014";
+    }
+  }), /*#__PURE__*/React.createElement(LN, {
+    type: "monotone",
+    dataKey: props.dataKey,
+    stroke: props.color,
+    strokeWidth: 1.5,
+    dot: false,
+    connectNulls: true
+  })))));
+}
+function ApiKeyStrip(props) {
+  var apiKey = props.apiKey;
+  var onChange = props.onChange;
+  var editing = useState(!apiKey);
+  var draft = useState(apiKey || "");
+  function save() {
+    var cleaned = draft[0].trim();
+    onChange(cleaned);
+    editing[1](false);
+  }
+  var btn = {
+    fontSize: "12px",
+    fontWeight: 500,
+    padding: "8px 16px",
+    background: C.gold,
+    color: C.bg,
+    border: "none",
+    borderRadius: "2px",
+    cursor: "pointer"
+  };
+  var btnSec = Object.assign({}, btn, {
+    background: "transparent",
+    color: C.text,
+    border: "1px solid " + C.borderStrong
+  });
+  if (!editing[0]) {
+    return /*#__PURE__*/React.createElement("div", {
+      className: "mb-5 p-3 rounded-sm flex items-center justify-between gap-3 flex-wrap",
+      style: {
+        background: C.bg,
+        border: "1px solid " + C.border,
+        fontSize: "12px",
+        color: C.textMuted
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "flex items-center gap-2"
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        width: "6px",
+        height: "6px",
+        background: C.green,
+        borderRadius: "50%"
+      }
+    }), /*#__PURE__*/React.createElement("span", null, "Alpha Vantage key configured"), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.textFaint
+      }
+    }, "· ending in ", apiKey.slice(-4))), /*#__PURE__*/React.createElement("button", {
+      onClick: function () {
+        draft[1](apiKey);
+        editing[1](true);
+      },
+      style: btnSec
+    }, "Change key"));
+  }
+  return /*#__PURE__*/React.createElement("div", {
+    className: "mb-5 p-4 rounded-sm",
+    style: {
+      background: C.bg,
+      border: "1px dashed " + C.borderStrong
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: "12px",
+      color: C.textMuted,
+      marginBottom: "10px",
+      lineHeight: 1.6
+    }
+  }, "Stock lookup uses Alpha Vantage (free tier: 25 requests/day, 5/min). Get a free key from", " ", /*#__PURE__*/React.createElement("a", {
+    href: AV_KEY_URL,
+    target: "_blank",
+    rel: "noreferrer",
+    style: {
+      color: C.gold
+    }
+  }, "alphavantage.co/support/#api-key"), " \u2014 30 seconds, no credit card. Stored locally in your browser only."), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2 flex-wrap"
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    value: draft[0],
+    onChange: function (e) {
+      draft[1](e.target.value);
+    },
+    placeholder: "paste your API key here",
+    style: {
+      flex: "1 1 240px",
+      padding: "8px 12px",
+      background: C.bg,
+      border: "1px solid " + C.borderStrong,
+      borderRadius: "2px",
+      color: C.text,
+      fontFamily: "'JetBrains Mono', monospace",
+      fontSize: "12px"
+    }
+  }), /*#__PURE__*/React.createElement("button", {
+    onClick: save,
+    disabled: !draft[0].trim(),
+    style: Object.assign({}, btn, {
+      opacity: draft[0].trim() ? 1 : 0.5
+    })
+  }, "Save"), apiKey && /*#__PURE__*/React.createElement("button", {
+    onClick: function () {
+      editing[1](false);
+    },
+    style: btnSec
+  }, "Cancel")));
+}
+function ResultTile(props) {
+  return /*#__PURE__*/React.createElement("div", {
+    className: "p-4 rounded-sm",
+    style: {
+      background: C.bg,
+      border: "1px solid " + C.border
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: "10px",
+      fontWeight: 600,
+      letterSpacing: "0.12em",
+      color: C.textMuted,
+      textTransform: "uppercase"
+    }
+  }, props.label), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "'Fraunces', serif",
+      fontSize: "24px",
+      fontWeight: 500,
+      color: C.text,
+      marginTop: "4px",
+      letterSpacing: "-0.01em",
+      lineHeight: 1.1
+    }
+  }, props.primary), props.sub && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: "11px",
+      color: C.textFaint,
+      marginTop: "4px"
+    }
+  }, props.sub));
+}
+function StockLookup(props) {
+  var apiKey = props.apiKey;
+  var history = props.history;
+  var onSearch = props.onSearch;
+  var onApiKeyChange = props.onApiKeyChange;
+  var tick = useState("");
+  var running = useState(false);
+  var statusMsg = useState(null);
+  var result = useState(null);
+  var error = useState(null);
+  var cleaned = tick[0].trim().toUpperCase();
+  var past = useMemo(function () {
+    if (!cleaned) return [];
+    return history.filter(function (h) {
+      return h.ticker === cleaned;
+    }).slice(0, 5);
+  }, [cleaned, history]);
+  function run() {
+    if (!cleaned) return;
+    if (!apiKey) {
+      error[1]("Save an Alpha Vantage API key first (top of this section).");
+      return;
+    }
+    var wait = checkRate(2);
+    if (wait > 0) {
+      error[1]("Slow down \u2014 Alpha Vantage allows 5/min. Wait " + wait + "s.");
+      return;
+    }
+    running[1](true);
+    error[1](null);
+    result[1](null);
+    statusMsg[1]("Fetching fundamentals...");
+    fetchOverview(cleaned, apiKey).then(function (overview) {
+      return sleep(AV_GAP_MS).then(function () {
+        statusMsg[1]("Fetching latest price...");
+        return fetchQuote(cleaned, apiKey).then(function (quoteRes) {
+          var entry = {
+            timestamp: new Date().toISOString(),
+            date: todayISO(),
+            ticker: cleaned,
+            name: overview.Name || cleaned,
+            price: quoteRes.price,
+            priceError: quoteRes.error,
+            marketCap: num(overview.MarketCapitalization),
+            trailingPE: num(overview.PERatio),
+            forwardPE: num(overview.ForwardPE),
+            forwardPEG: num(overview.PEGRatio),
+            instHeldPct: parseAVPct(overview.PercentInstitutions)
+          };
+          result[1](entry);
+          onSearch(entry);
+        });
+      });
+    }).catch(function (e) {
+      error[1](e.message);
+    }).then(function () {
+      running[1](false);
+      statusMsg[1](null);
+    });
+  }
+  var btn = {
+    fontSize: "13px",
+    fontWeight: 500,
+    letterSpacing: "0.04em",
+    padding: "10px 24px",
+    background: C.gold,
+    color: C.bg,
+    border: "none",
+    borderRadius: "2px",
+    cursor: "pointer"
+  };
+  return /*#__PURE__*/React.createElement("section", {
+    className: "mb-12 p-6 rounded-sm",
+    style: {
+      background: C.bgCard,
+      border: "1px solid " + C.border
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "mb-1",
+    style: {
+      fontSize: "11px",
+      fontWeight: 600,
+      letterSpacing: "0.12em",
+      color: C.textMuted,
+      textTransform: "uppercase"
+    }
+  }, "Stock Lookup"), /*#__PURE__*/React.createElement("h2", {
+    style: {
+      fontFamily: "'Fraunces', serif",
+      fontSize: "22px",
+      fontWeight: 500,
+      margin: "0 0 16px 0",
+      letterSpacing: "-0.01em"
+    }
+  }, "Look up a ticker"), /*#__PURE__*/React.createElement(ApiKeyStrip, {
+    apiKey: apiKey,
+    onChange: onApiKeyChange
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2 flex-wrap items-center"
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    value: tick[0],
+    onChange: function (e) {
+      tick[1](e.target.value);
+    },
+    onKeyDown: function (e) {
+      if (e.key === "Enter") run();
+    },
+    placeholder: "e.g. AAPL",
+    style: {
+      flex: "0 1 240px",
+      padding: "10px 14px",
+      background: C.bg,
+      border: "1px solid " + C.borderStrong,
+      borderRadius: "2px",
+      color: C.text,
+      fontFamily: "'JetBrains Mono', monospace",
+      fontSize: "14px",
+      letterSpacing: "0.05em",
+      textTransform: "uppercase"
+    }
+  }), /*#__PURE__*/React.createElement("button", {
+    onClick: run,
+    disabled: running[0] || !cleaned || !apiKey,
+    style: Object.assign({}, btn, {
+      opacity: running[0] || !cleaned || !apiKey ? 0.5 : 1
+    })
+  }, running[0] ? statusMsg[0] || "Running..." : "Run")), error[0] && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: "16px",
+      padding: "10px 14px",
+      background: "rgba(197, 82, 74, 0.1)",
+      border: "1px solid " + C.red,
+      borderRadius: "2px",
+      fontSize: "12px",
+      color: C.red,
+      fontFamily: "'JetBrains Mono', monospace"
+    }
+  }, error[0]), result[0] && /*#__PURE__*/React.createElement("div", null, result[0].priceError && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: "16px",
+      padding: "8px 14px",
+      background: "rgba(197, 160, 74, 0.08)",
+      border: "1px solid " + C.yellow,
+      borderRadius: "2px",
+      fontSize: "11px",
+      color: C.yellow,
+      fontFamily: "'JetBrains Mono', monospace"
+    }
+  }, "Quote failed \u2014 fundamentals only. Reason: ", result[0].priceError), /*#__PURE__*/React.createElement("div", {
+    className: "mt-4 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3"
+  }, /*#__PURE__*/React.createElement(ResultTile, {
+    label: result[0].ticker,
+    sub: result[0].name,
+    primary: fmtPrice(result[0].price)
+  }), /*#__PURE__*/React.createElement(ResultTile, {
+    label: "Market Cap",
+    primary: fmtMcap(result[0].marketCap)
+  }), /*#__PURE__*/React.createElement(ResultTile, {
+    label: "Current P/E",
+    primary: fmtNum(result[0].trailingPE, 2)
+  }), /*#__PURE__*/React.createElement(ResultTile, {
+    label: "Forward P/E",
+    primary: fmtNum(result[0].forwardPE, 2)
+  }), /*#__PURE__*/React.createElement(ResultTile, {
+    label: "Forward PEG",
+    primary: fmtNum(result[0].forwardPEG, 2),
+    sub: "Alpha Vantage"
+  }), /*#__PURE__*/React.createElement(ResultTile, {
+    label: "Inst. held",
+    primary: fmtPct(result[0].instHeldPct)
+  }))), !running[0] && !result[0] && cleaned && past.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "mt-6"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: "11px",
+      fontWeight: 600,
+      letterSpacing: "0.12em",
+      color: C.textMuted,
+      textTransform: "uppercase",
+      marginBottom: "10px"
+    }
+  }, "Past searches · ", cleaned, " · last ", past.length), /*#__PURE__*/React.createElement(PastTable, {
+    rows: past
+  })), !running[0] && !result[0] && cleaned && past.length === 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: "12px",
+      color: C.textFaint,
+      marginTop: "16px",
+      fontFamily: "'JetBrains Mono', monospace"
+    }
+  }, "No prior searches for ", cleaned, ". Press Run to look it up."));
+}
+function PastTable(props) {
+  var cell = {
+    fontFamily: "'JetBrains Mono', monospace",
+    fontSize: "12px",
+    color: C.text,
+    padding: "8px 12px",
+    borderBottom: "1px solid " + C.border
+  };
+  var head = {
+    fontSize: "10px",
+    fontWeight: 600,
+    letterSpacing: "0.1em",
+    color: C.textMuted,
+    textTransform: "uppercase",
+    padding: "10px 12px",
+    borderBottom: "1px solid " + C.borderStrong,
+    textAlign: "left"
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "rounded-sm overflow-x-auto",
+    style: {
+      background: C.bg,
+      border: "1px solid " + C.border
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    className: "w-full",
+    style: {
+      minWidth: "720px"
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", {
+    style: head
+  }, "Date"), /*#__PURE__*/React.createElement("th", {
+    style: Object.assign({}, head, {
+      textAlign: "right"
+    })
+  }, "Price"), /*#__PURE__*/React.createElement("th", {
+    style: Object.assign({}, head, {
+      textAlign: "right"
+    })
+  }, "Mkt Cap"), /*#__PURE__*/React.createElement("th", {
+    style: Object.assign({}, head, {
+      textAlign: "right"
+    })
+  }, "P/E"), /*#__PURE__*/React.createElement("th", {
+    style: Object.assign({}, head, {
+      textAlign: "right"
+    })
+  }, "Fwd P/E"), /*#__PURE__*/React.createElement("th", {
+    style: Object.assign({}, head, {
+      textAlign: "right"
+    })
+  }, "Fwd PEG"), /*#__PURE__*/React.createElement("th", {
+    style: Object.assign({}, head, {
+      textAlign: "right"
+    })
+  }, "Inst. %"))), /*#__PURE__*/React.createElement("tbody", null, props.rows.map(function (r, i) {
+    return /*#__PURE__*/React.createElement("tr", {
+      key: r.timestamp + "-" + i
+    }, /*#__PURE__*/React.createElement("td", {
+      style: cell
+    }, r.date), /*#__PURE__*/React.createElement("td", {
+      style: Object.assign({}, cell, {
+        textAlign: "right"
+      })
+    }, fmtPrice(r.price)), /*#__PURE__*/React.createElement("td", {
+      style: Object.assign({}, cell, {
+        textAlign: "right"
+      })
+    }, fmtMcap(r.marketCap)), /*#__PURE__*/React.createElement("td", {
+      style: Object.assign({}, cell, {
+        textAlign: "right"
+      })
+    }, fmtNum(r.trailingPE, 2)), /*#__PURE__*/React.createElement("td", {
+      style: Object.assign({}, cell, {
+        textAlign: "right"
+      })
+    }, fmtNum(r.forwardPE, 2)), /*#__PURE__*/React.createElement("td", {
+      style: Object.assign({}, cell, {
+        textAlign: "right"
+      })
+    }, fmtNum(r.forwardPEG, 2)), /*#__PURE__*/React.createElement("td", {
+      style: Object.assign({}, cell, {
+        textAlign: "right"
+      })
+    }, fmtPct(r.instHeldPct)));
+  }))));
+}
+function HistoryTable(props) {
+  var recent = props.snapshots.slice().reverse().slice(0, 14);
+  if (recent.length === 0) return null;
+  var cell = {
+    fontFamily: "'JetBrains Mono', monospace",
+    fontSize: "13px",
+    color: C.text,
+    padding: "10px 14px",
+    borderBottom: "1px solid " + C.border
+  };
+  var head = {
+    fontSize: "10px",
+    fontWeight: 600,
+    letterSpacing: "0.12em",
+    color: C.textMuted,
+    textTransform: "uppercase",
+    padding: "12px 14px",
+    borderBottom: "1px solid " + C.borderStrong,
+    textAlign: "left"
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "rounded-sm overflow-x-auto",
+    style: {
+      background: C.bgCard,
+      border: "1px solid " + C.border
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    className: "w-full",
+    style: {
+      minWidth: "720px"
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", {
+    style: head
+  }, "Date"), /*#__PURE__*/React.createElement("th", {
+    style: Object.assign({}, head, {
+      textAlign: "right"
+    })
+  }, "S&P 500"), /*#__PURE__*/React.createElement("th", {
+    style: Object.assign({}, head, {
+      textAlign: "right"
+    })
+  }, "F&G"), /*#__PURE__*/React.createElement("th", {
+    style: Object.assign({}, head, {
+      textAlign: "right"
+    })
+  }, "VIX"), /*#__PURE__*/React.createElement("th", {
+    style: Object.assign({}, head, {
+      textAlign: "right"
+    })
+  }, "%>50MA"), /*#__PURE__*/React.createElement("th", {
+    style: Object.assign({}, head, {
+      textAlign: "right"
+    })
+  }, "%>200MA"))), /*#__PURE__*/React.createElement("tbody", null, recent.map(function (s) {
+    return /*#__PURE__*/React.createElement("tr", {
+      key: s.date
+    }, /*#__PURE__*/React.createElement("td", {
+      style: cell
+    }, s.date), /*#__PURE__*/React.createElement("td", {
+      style: Object.assign({}, cell, {
+        textAlign: "right"
+      })
+    }, fmtPrice(s.sp500)), /*#__PURE__*/React.createElement("td", {
+      style: Object.assign({}, cell, {
+        textAlign: "right"
+      })
+    }, fmtNum(s.fearGreed, 1)), /*#__PURE__*/React.createElement("td", {
+      style: Object.assign({}, cell, {
+        textAlign: "right"
+      })
+    }, fmtNum(s.vix, 2)), /*#__PURE__*/React.createElement("td", {
+      style: Object.assign({}, cell, {
+        textAlign: "right"
+      })
+    }, fmtNum(s.spxAbove50, 1)), /*#__PURE__*/React.createElement("td", {
+      style: Object.assign({}, cell, {
+        textAlign: "right"
+      })
+    }, fmtNum(s.spxAbove200, 1)));
+  }))));
+}
+function SearchHistorySection(props) {
+  var history = props.history;
+  var recent = history.slice(0, 50);
+  var cell = {
+    fontFamily: "'JetBrains Mono', monospace",
+    fontSize: "12px",
+    color: C.text,
+    padding: "8px 12px",
+    borderBottom: "1px solid " + C.border
+  };
+  var head = {
+    fontSize: "10px",
+    fontWeight: 600,
+    letterSpacing: "0.1em",
+    color: C.textMuted,
+    textTransform: "uppercase",
+    padding: "10px 12px",
+    borderBottom: "1px solid " + C.borderStrong,
+    textAlign: "left"
+  };
+  var btnSec = {
+    fontSize: "12px",
+    fontWeight: 500,
+    letterSpacing: "0.04em",
+    padding: "8px 16px",
+    background: "transparent",
+    color: C.text,
+    border: "1px solid " + C.borderStrong,
+    borderRadius: "2px",
+    cursor: "pointer"
+  };
+  return /*#__PURE__*/React.createElement("section", {
+    className: "mb-12"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-baseline justify-between flex-wrap gap-2 mb-5"
+  }, /*#__PURE__*/React.createElement("h2", {
+    style: {
+      fontFamily: "'Fraunces', serif",
+      fontSize: "22px",
+      fontWeight: 500,
+      margin: 0,
+      letterSpacing: "-0.01em"
+    }
+  }, "Search history ·", " ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.textMuted,
+      fontSize: "16px"
+    }
+  }, history.length, " ", history.length === 1 ? "search" : "searches", " stored")), history.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2"
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: props.onExport,
+    style: btnSec
+  }, "Export CSV"), /*#__PURE__*/React.createElement("button", {
+    onClick: props.onClear,
+    style: Object.assign({}, btnSec, {
+      color: C.red,
+      borderColor: C.red
+    })
+  }, "Clear all"))), history.length === 0 ? /*#__PURE__*/React.createElement("div", {
+    className: "p-8 rounded-sm text-center",
+    style: {
+      background: C.bgCard,
+      border: "1px dashed " + C.border,
+      color: C.textMuted
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: "14px"
+    }
+  }, "No searches yet. Look up a ticker above to start building history.")) : /*#__PURE__*/React.createElement("div", {
+    className: "rounded-sm overflow-x-auto",
+    style: {
+      background: C.bgCard,
+      border: "1px solid " + C.border
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    className: "w-full",
+    style: {
+      minWidth: "820px"
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", {
+    style: head
+  }, "Date"), /*#__PURE__*/React.createElement("th", {
+    style: head
+  }, "Ticker"), /*#__PURE__*/React.createElement("th", {
+    style: head
+  }, "Name"), /*#__PURE__*/React.createElement("th", {
+    style: Object.assign({}, head, {
+      textAlign: "right"
+    })
+  }, "Price"), /*#__PURE__*/React.createElement("th", {
+    style: Object.assign({}, head, {
+      textAlign: "right"
+    })
+  }, "Mkt Cap"), /*#__PURE__*/React.createElement("th", {
+    style: Object.assign({}, head, {
+      textAlign: "right"
+    })
+  }, "P/E"), /*#__PURE__*/React.createElement("th", {
+    style: Object.assign({}, head, {
+      textAlign: "right"
+    })
+  }, "Fwd P/E"), /*#__PURE__*/React.createElement("th", {
+    style: Object.assign({}, head, {
+      textAlign: "right"
+    })
+  }, "Fwd PEG"), /*#__PURE__*/React.createElement("th", {
+    style: Object.assign({}, head, {
+      textAlign: "right"
+    })
+  }, "Inst. %"))), /*#__PURE__*/React.createElement("tbody", null, recent.map(function (r, i) {
+    return /*#__PURE__*/React.createElement("tr", {
+      key: r.timestamp + "-" + i
+    }, /*#__PURE__*/React.createElement("td", {
+      style: cell
+    }, r.date), /*#__PURE__*/React.createElement("td", {
+      style: Object.assign({}, cell, {
+        color: C.gold
+      })
+    }, r.ticker), /*#__PURE__*/React.createElement("td", {
+      style: Object.assign({}, cell, {
+        color: C.textMuted,
+        maxWidth: "200px",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap"
+      })
+    }, r.name || "\u2014"), /*#__PURE__*/React.createElement("td", {
+      style: Object.assign({}, cell, {
+        textAlign: "right"
+      })
+    }, fmtPrice(r.price)), /*#__PURE__*/React.createElement("td", {
+      style: Object.assign({}, cell, {
+        textAlign: "right"
+      })
+    }, fmtMcap(r.marketCap)), /*#__PURE__*/React.createElement("td", {
+      style: Object.assign({}, cell, {
+        textAlign: "right"
+      })
+    }, fmtNum(r.trailingPE, 2)), /*#__PURE__*/React.createElement("td", {
+      style: Object.assign({}, cell, {
+        textAlign: "right"
+      })
+    }, fmtNum(r.forwardPE, 2)), /*#__PURE__*/React.createElement("td", {
+      style: Object.assign({}, cell, {
+        textAlign: "right"
+      })
+    }, fmtNum(r.forwardPEG, 2)), /*#__PURE__*/React.createElement("td", {
+      style: Object.assign({}, cell, {
+        textAlign: "right"
+      })
+    }, fmtPct(r.instHeldPct)));
+  }))), history.length > 50 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "10px 12px",
+      fontSize: "11px",
+      color: C.textFaint,
+      textAlign: "right"
+    }
+  }, "Showing 50 most recent · all ", history.length, " included in CSV export")));
+}
+function Dashboard() {
+  var snapshots = useState([]);
+  var loading = useState(true);
+  var refreshing = useState(false);
+  var error = useState(null);
+  var lastRefresh = useState(null);
+  var searchHistory = useState(loadHistory());
+  var apiKey = useState(loadApiKey());
+  var today = todayISO();
+  var snaps = snapshots[0];
+  var latest = snaps[snaps.length - 1];
+  var prev = snaps.length >= 2 ? snaps[snaps.length - 2] : null;
+  var load = useCallback(function (silent) {
+    if (!silent) refreshing[1](true);
+    error[1](null);
+    return fetchCSV().then(function (data) {
+      snapshots[1](data);
+      lastRefresh[1](new Date());
+    }).catch(function (e) {
+      error[1]("Couldn't load data: " + e.message);
+    }).then(function () {
+      refreshing[1](false);
+      loading[1](false);
+    });
+  }, []);
+  useEffect(function () {
+    load(false);
+    var iv = setInterval(function () {
+      load(true);
+    }, REFRESH_INTERVAL_MS);
+    return function () {
+      clearInterval(iv);
+    };
+  }, [load]);
+  function onSearchAppend(entry) {
+    var updated = appendSearch(entry);
+    searchHistory[1](updated);
+  }
+  function onClear() {
+    if (!window.confirm("Delete all search history? This can't be undone.")) return;
+    localStorage.removeItem(SEARCH_KEY);
+    searchHistory[1]([]);
+  }
+  function onExport() {
+    var hdrs = "timestamp,date,ticker,name,price,market_cap,trailing_pe,forward_pe,forward_peg,inst_held_pct\n";
+    var rows = searchHistory[0].map(function (r) {
+      var safeName = (r.name || "").replace(/,/g, " ").replace(/"/g, "'");
+      return [r.timestamp, r.date, r.ticker, safeName, r.price != null ? r.price : "", r.marketCap != null ? r.marketCap : "", r.trailingPE != null ? r.trailingPE : "", r.forwardPE != null ? r.forwardPE : "", r.forwardPEG != null ? r.forwardPEG : "", r.instHeldPct != null ? r.instHeldPct : ""].join(",");
+    }).join("\n");
+    var blob = new Blob([hdrs + rows], {
+      type: "text/csv"
+    });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = "stock-searches-" + todayISO() + ".csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+  function onApiKeyChange(key) {
+    apiKey[1](key);
+    saveApiKeyToLS(key);
+  }
+  var btn = {
+    fontSize: "13px",
+    fontWeight: 500,
+    letterSpacing: "0.04em",
+    padding: "10px 20px",
+    background: C.gold,
+    color: C.bg,
+    border: "none",
+    borderRadius: "2px",
+    cursor: "pointer"
+  };
+  var lastRefreshLabel = lastRefresh[0] ? lastRefresh[0].toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit"
+  }) : "\u2014";
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: C.bg,
+      minHeight: "100vh",
+      padding: "48px 32px"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      maxWidth: "1200px",
+      margin: "0 auto"
+    }
+  }, /*#__PURE__*/React.createElement("header", {
+    className: "mb-12"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-baseline justify-between flex-wrap gap-4"
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "'JetBrains Mono', monospace",
+      fontSize: "11px",
+      color: C.gold,
+      letterSpacing: "0.2em",
+      textTransform: "uppercase",
+      marginBottom: "8px"
+    }
+  }, "\u2014 Market Pulse \u2014"), /*#__PURE__*/React.createElement("h1", {
+    style: {
+      fontFamily: "'Fraunces', serif",
+      fontSize: "44px",
+      fontWeight: 500,
+      lineHeight: 1.1,
+      letterSpacing: "-0.02em",
+      color: C.text,
+      margin: 0
+    }
+  }, "Daily breadth & sentiment"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: "14px",
+      color: C.textMuted,
+      marginTop: "10px"
+    }
+  }, fmtDateLong(today))), /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center gap-3 flex-wrap"
+  }, lastRefresh[0] && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: "'JetBrains Mono', monospace",
+      fontSize: "11px",
+      color: C.textFaint
+    }
+  }, "Last refresh · ", lastRefreshLabel), /*#__PURE__*/React.createElement("button", {
+    onClick: function () {
+      load(false);
+    },
+    disabled: refreshing[0],
+    style: Object.assign({}, btn, {
+      opacity: refreshing[0] ? 0.6 : 1
+    })
+  }, refreshing[0] ? "Refreshing..." : "Refresh"))), error[0] && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: "16px",
+      padding: "12px 16px",
+      background: "rgba(197, 82, 74, 0.1)",
+      border: "1px solid " + C.red,
+      borderRadius: "2px",
+      fontSize: "13px",
+      color: C.red,
+      fontFamily: "'JetBrains Mono', monospace"
+    }
+  }, error[0])), /*#__PURE__*/React.createElement("section", {
+    className: "mb-12"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-baseline justify-between mb-5"
+  }, /*#__PURE__*/React.createElement("h2", {
+    style: {
+      fontFamily: "'Fraunces', serif",
+      fontSize: "22px",
+      fontWeight: 500,
+      margin: 0,
+      letterSpacing: "-0.01em"
+    }
+  }, loading[0] ? "Loading..." : latest ? "Latest reading" : "No data"), latest && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: "'JetBrains Mono', monospace",
+      fontSize: "11px",
+      color: C.textMuted
+    }
+  }, latest.date)), latest && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(SP500Banner, {
+    snap: latest,
+    prevSnap: prev
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4"
+  }, /*#__PURE__*/React.createElement(MetricCard, {
+    label: "Fear & Greed",
+    ticker: "CNN",
+    value: latest.fearGreed,
+    status: fgStatus(latest.fearGreed),
+    description: "CNN's composite of 7 sentiment signals. 0 = extreme fear, 100 = extreme greed."
+  }), /*#__PURE__*/React.createElement(MetricCard, {
+    label: "Volatility",
+    ticker: "^VIX",
+    value: latest.vix,
+    status: vixStatus(latest.vix),
+    description: "CBOE Volatility Index \u2014 implied 30-day S&P 500 volatility from options."
+  }), /*#__PURE__*/React.createElement(MetricCard, {
+    label: "% above 50-day MA",
+    ticker: "$S5FI",
+    value: latest.spxAbove50,
+    status: breadthStatus(latest.spxAbove50),
+    description: "Share of S&P 500 names trading above their 50-day SMA. Short-term breadth."
+  }), /*#__PURE__*/React.createElement(MetricCard, {
+    label: "% above 200-day MA",
+    ticker: "$S5TH",
+    value: latest.spxAbove200,
+    status: breadthStatus(latest.spxAbove200),
+    description: "Share of S&P 500 names trading above their 200-day SMA. Long-term breadth."
+  })))), snaps.length >= 2 && /*#__PURE__*/React.createElement("section", {
+    className: "mb-12"
+  }, /*#__PURE__*/React.createElement(MarketBreadthChart, {
+    data: snaps
+  })), snaps.length >= 2 && /*#__PURE__*/React.createElement("section", {
+    className: "mb-12"
+  }, /*#__PURE__*/React.createElement("h2", {
+    style: {
+      fontFamily: "'Fraunces', serif",
+      fontSize: "22px",
+      fontWeight: 500,
+      margin: "0 0 20px 0",
+      letterSpacing: "-0.01em"
+    }
+  }, "Sentiment & volatility ·", " ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.textMuted,
+      fontSize: "16px"
+    }
+  }, snaps.length, " days")), /*#__PURE__*/React.createElement("div", {
+    className: "grid grid-cols-1 md:grid-cols-2 gap-4"
+  }, /*#__PURE__*/React.createElement(MiniChart, {
+    data: snaps,
+    dataKey: "fearGreed",
+    color: C.gold,
+    label: "Fear & Greed",
+    domain: [0, 100],
+    refLines: [{
+      y: 25
+    }, {
+      y: 50
+    }, {
+      y: 75
+    }]
+  }), /*#__PURE__*/React.createElement(MiniChart, {
+    data: snaps,
+    dataKey: "vix",
+    color: C.red,
+    label: "VIX",
+    domain: ["auto", "auto"],
+    refLines: [{
+      y: 20
+    }, {
+      y: 30
+    }]
+  }))), snaps.length > 0 && /*#__PURE__*/React.createElement("section", {
+    className: "mb-12"
+  }, /*#__PURE__*/React.createElement("h2", {
+    style: {
+      fontFamily: "'Fraunces', serif",
+      fontSize: "22px",
+      fontWeight: 500,
+      margin: "0 0 20px 0",
+      letterSpacing: "-0.01em"
+    }
+  }, "History ·", " ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.textMuted,
+      fontSize: "16px"
+    }
+  }, snaps.length, " ", snaps.length === 1 ? "snapshot" : "snapshots", " total")), /*#__PURE__*/React.createElement(HistoryTable, {
+    snapshots: snaps
+  }), snaps.length > 14 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: "12px",
+      color: C.textMuted,
+      marginTop: "12px",
+      textAlign: "right"
+    }
+  }, "Showing 14 most recent ·", " ", /*#__PURE__*/React.createElement("a", {
+    href: RAW_URL,
+    target: "_blank",
+    rel: "noreferrer",
+    style: {
+      color: C.gold
+    }
+  }, "view full CSV"))), /*#__PURE__*/React.createElement(StockLookup, {
+    history: searchHistory[0],
+    onSearch: onSearchAppend,
+    apiKey: apiKey[0],
+    onApiKeyChange: onApiKeyChange
+  }), /*#__PURE__*/React.createElement(SearchHistorySection, {
+    history: searchHistory[0],
+    onClear: onClear,
+    onExport: onExport
+  }), /*#__PURE__*/React.createElement("footer", {
+    style: {
+      marginTop: "64px",
+      paddingTop: "24px",
+      borderTop: "1px solid " + C.border,
+      fontSize: "12px",
+      color: C.textFaint,
+      lineHeight: 1.7
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: "8px"
+    }
+  }, "Auto-refreshes every 15 minutes. Data collected daily by GitHub Actions from", " ", /*#__PURE__*/React.createElement("a", {
+    href: "https://github.com/" + GH_USER + "/" + GH_REPO,
+    target: "_blank",
+    rel: "noreferrer",
+    style: {
+      color: C.textMuted
+    }
+  }, GH_USER, "/", GH_REPO), "."), /*#__PURE__*/React.createElement("div", null, "Dashboard sources: Yahoo Finance (^GSPC, ^VIX) · CNN Business · Barchart ($S5FI, $S5TH). Stock lookup: Alpha Vantage (25 req/day, 5/min, free)."))));
+}
+var root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(/*#__PURE__*/React.createElement(Dashboard, null));
+</script>
+</body>
+</html>
